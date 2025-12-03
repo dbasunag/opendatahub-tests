@@ -5,6 +5,9 @@ from ocp_resources.pod import Pod
 from ocp_resources.service import Service
 from utilities.constants import MinIo
 from simple_logger.logger import get_logger
+from timeout_sampler import TimeoutExpiredError
+
+from utilities.general import collect_pod_information
 
 LOGGER = get_logger(name=__name__)
 
@@ -115,7 +118,11 @@ def upload_test_model_to_minio_from_image(
         wait_for_resource=True,
     ) as upload_pod:
         LOGGER.info(f"Extracting model from image {model_image} and uploading to MinIO: {object_key}")
-        upload_pod.wait_for_status(status="Succeeded", timeout=300)
+        try:
+            upload_pod.wait_for_status(status="Succeeded", timeout=300)
+        except TimeoutExpiredError:
+            collect_pod_information(pod=upload_pod)
+            raise
 
         # Get upload logs for verification
         try:

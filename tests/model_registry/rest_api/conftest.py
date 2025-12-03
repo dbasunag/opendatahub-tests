@@ -10,13 +10,12 @@ from tests.model_registry.rest_api.utils import (
     execute_model_registry_patch_command,
     get_mr_deployment,
 )
-from utilities.general import generate_random_name
+from utilities.general import generate_random_name, wait_for_pods_running
 from ocp_resources.deployment import Deployment
 from tests.model_registry.utils import (
     get_model_registry_deployment_template_dict,
     apply_mysql_args_and_volume_mounts,
     add_mysql_certs_volumes_to_deployment,
-    wait_for_pods_running,
     get_mr_standard_labels,
     get_mysql_config,
 )
@@ -28,6 +27,7 @@ from tests.model_registry.constants import (
     CA_CONFIGMAP_NAME,
     OAUTH_PROXY_CONFIG_DICT,
     SECURE_MR_NAME,
+    KUBERBACPROXY_STR,
 )
 from ocp_resources.resource import ResourceEditor
 from ocp_resources.secret import Secret
@@ -166,7 +166,7 @@ def deploy_secure_mysql_and_mr(
         wait_for_resource=True,
     ) as mr:
         mr.wait_for_condition(condition="Available", status="True")
-        mr.wait_for_condition(condition="OAuthProxyAvailable", status="True")
+        mr.wait_for_condition(condition=KUBERBACPROXY_STR, status="True")
         wait_for_pods_running(
             admin_client=admin_client, namespace_name=model_registry_namespace, number_of_consecutive_checks=6
         )
@@ -257,6 +257,9 @@ def patch_mysql_deployment_with_ssl_ca(
 
     patch = {"spec": {"template": {"spec": {"volumes": volumes, "containers": [my_sql_container]}}}}
     with ResourceEditor(patches={model_registry_db_deployments[0]: patch}):
+        wait_for_pods_running(
+            admin_client=admin_client, namespace_name=model_registry_namespace, number_of_consecutive_checks=3
+        )
         model_registry_db_deployments[0].wait_for_condition(condition="Available", status="True")
         yield model_registry_db_deployments[0]
 
@@ -323,6 +326,12 @@ def mysql_ssl_secrets(
         "server_cert_secret": server_cert_secret,
         "server_key_secret": server_key_secret,
     }
+    if ca_secret.exists:
+        ca_secret.delete(wait=True)
+    if server_cert_secret.exists:
+        server_cert_secret.delete(wait=True)
+    if server_key_secret.exists:
+        server_key_secret.delete(wait=True)
 
 
 @pytest.fixture(scope="function")
@@ -337,3 +346,27 @@ def model_data_for_test() -> Generator[dict[str, Any], None, None]:
     model_data = copy.deepcopy(MODEL_REGISTER_DATA)
     model_data["register_model_data"]["name"] = model_name
     yield model_data
+
+
+@pytest.fixture()
+def skip_if_not_default_db(request):
+    """
+    Fixture that skips the test if not using default postgres database
+    """
+    default_db = request.node.callspec.params.get("model_registry_metadata_db_resources", {}).get("db_name")
+    LOGGER.info(f"default_db: {default_db}")
+    if not default_db or default_db != "default":
+        pytest.skip(reason="This test is only relevant for default postgres db")
+
+
+@pytest.fixture()
+def model_registry_default_postgres_deployment_match_label(
+    model_registry_namespace: str, model_registry_instance: list[ModelRegistry]
+) -> dict[str, str]:
+    """
+    Returns the matchLabels from the default postgres deployment for filtering pods.
+    """
+    deployment = Deployment(
+        namespace=model_registry_namespace, name=f"{model_registry_instance[0].name}-postgres", ensure_exists=True
+    )
+    return deployment.instance.spec.selector.matchLabels

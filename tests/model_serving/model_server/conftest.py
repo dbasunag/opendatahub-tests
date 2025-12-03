@@ -1,10 +1,11 @@
-from typing import Any, Generator
+from typing import Any, Generator, Dict
 
 import pytest
 import yaml
 from _pytest.fixtures import FixtureRequest
 from kubernetes.dynamic import DynamicClient
 from ocp_resources.config_map import ConfigMap
+from ocp_resources.gateway import Gateway
 from ocp_resources.inference_service import InferenceService
 from ocp_resources.namespace import Namespace
 from ocp_resources.persistent_volume_claim import PersistentVolumeClaim
@@ -13,29 +14,116 @@ from ocp_resources.secret import Secret
 from ocp_resources.service_account import ServiceAccount
 from ocp_resources.serving_runtime import ServingRuntime
 from ocp_resources.storage_class import StorageClass
+from ocp_resources.llm_inference_service import LLMInferenceService
+from ocp_resources.data_science_cluster import DataScienceCluster
+from ocp_resources.cluster_service_version import ClusterServiceVersion
+from kubernetes.dynamic.exceptions import ResourceNotFoundError
+from utilities.kueue_utils import (
+    create_local_queue,
+    create_cluster_queue,
+    create_resource_flavor,
+    LocalQueue,
+    ClusterQueue,
+    ResourceFlavor,
+)
+from pytest_testconfig import config as py_config
 from simple_logger.logger import get_logger
 
 from utilities.constants import (
     KServeDeploymentType,
     ModelFormat,
-    ModelInferenceRuntime,
-    ModelStoragePath,
-    Protocols,
     RuntimeTemplates,
     StorageClassName,
+    DscComponents,
 )
 from utilities.constants import (
     ModelAndFormat,
-    ModelVersion,
 )
+from utilities.llmd_utils import create_llmd_gateway, create_llmisvc
 from utilities.inference_utils import create_isvc
+from utilities.llmd_constants import (
+    LLMDGateway,
+    ModelStorage,
+    ContainerImages,
+)
 from utilities.infra import (
     s3_endpoint_secret,
     update_configmap_data,
 )
+from utilities.constants import Timeout
 from utilities.serving_runtime import ServingRuntimeFromTemplate
 
 LOGGER = get_logger(name=__name__)
+
+
+# LLMD Fixtures
+@pytest.fixture(scope="class")
+def llmd_inference_service(
+    request: FixtureRequest,
+    admin_client: DynamicClient,
+    unprivileged_model_namespace: Namespace,
+) -> Generator[LLMInferenceService, None, None]:
+    if isinstance(request.param, str):
+        name_suffix = request.param
+        kwargs = {}
+    else:
+        name_suffix = request.param.get("name_suffix", "basic")
+        kwargs = {k: v for k, v in request.param.items() if k != "name_suffix"}
+
+    service_name = kwargs.get("name", f"llm-{name_suffix}")
+
+    if "llmd_gateway" in request.fixturenames:
+        request.getfixturevalue(argname="llmd_gateway")
+    container_resources = kwargs.get(
+        "container_resources",
+        {
+            "limits": {"cpu": "2", "memory": "16Gi"},
+            "requests": {"cpu": "500m", "memory": "12Gi"},
+        },
+    )
+
+    create_kwargs = {
+        "client": admin_client,
+        "name": service_name,
+        "namespace": unprivileged_model_namespace.name,
+        "storage_uri": kwargs.get("storage_uri", ModelStorage.TINYLLAMA_OCI),
+        "container_image": kwargs.get("container_image", ContainerImages.VLLM_CPU),
+        "container_resources": container_resources,
+        "wait": True,
+        "timeout": Timeout.TIMEOUT_15MIN,
+        **{k: v for k, v in kwargs.items() if k != "name"},
+    }
+
+    with create_llmisvc(**create_kwargs) as llm_service:
+        yield llm_service
+
+
+@pytest.fixture(scope="session")
+def gateway_namespace(admin_client: DynamicClient) -> str:
+    return LLMDGateway.DEFAULT_NAMESPACE
+
+
+@pytest.fixture(scope="session")
+def shared_llmd_gateway(
+    admin_client: DynamicClient,
+    gateway_namespace: str,
+) -> Generator[Gateway, None, None]:
+    gateway_class_name = "data-science-gateway-class"
+
+    with create_llmd_gateway(
+        client=admin_client,
+        namespace=gateway_namespace,
+        gateway_class_name=gateway_class_name,
+        wait_for_condition=True,
+        timeout=Timeout.TIMEOUT_5MIN,
+        teardown=True,
+    ) as gateway:
+        yield gateway
+
+
+@pytest.fixture(scope="class")
+def llmd_gateway(shared_llmd_gateway: Gateway) -> Gateway:
+    return shared_llmd_gateway
 
 
 @pytest.fixture(scope="class")
@@ -186,70 +274,6 @@ def skip_if_no_nfs_storage_class(admin_client: DynamicClient) -> None:
 
 
 @pytest.fixture(scope="class")
-def http_s3_openvino_model_mesh_inference_service(
-    request: FixtureRequest,
-    unprivileged_client: DynamicClient,
-    unprivileged_model_namespace: Namespace,
-    http_s3_ovms_model_mesh_serving_runtime: ServingRuntime,
-    ci_endpoint_s3_secret: Secret,
-    ci_service_account: ServiceAccount,
-) -> Generator[InferenceService, Any, Any]:
-    with create_isvc(
-        client=unprivileged_client,
-        name=f"{Protocols.HTTP}-{ModelFormat.OPENVINO}",
-        namespace=unprivileged_model_namespace.name,
-        runtime=http_s3_ovms_model_mesh_serving_runtime.name,
-        model_service_account=ci_service_account.name,
-        storage_key=ci_endpoint_s3_secret.name,
-        storage_path=request.param["model-path"],
-        model_format=ModelAndFormat.OPENVINO_IR,
-        deployment_mode=KServeDeploymentType.MODEL_MESH,
-        model_version=ModelVersion.OPSET1,
-    ) as isvc:
-        yield isvc
-
-
-@pytest.fixture(scope="class")
-def http_s3_ovms_model_mesh_serving_runtime(
-    request: FixtureRequest,
-    unprivileged_client: DynamicClient,
-    unprivileged_model_namespace: Namespace,
-) -> Generator[ServingRuntime, Any, Any]:
-    runtime_kwargs = {
-        "client": unprivileged_client,
-        "namespace": unprivileged_model_namespace.name,
-        "name": f"{Protocols.HTTP}-{ModelInferenceRuntime.OPENVINO_RUNTIME}",
-        "template_name": RuntimeTemplates.OVMS_MODEL_MESH,
-        "multi_model": True,
-        "protocol": Protocols.REST.upper(),
-        "resources": {
-            ModelFormat.OVMS: {
-                "requests": {"cpu": "1", "memory": "4Gi"},
-                "limits": {"cpu": "2", "memory": "8Gi"},
-            }
-        },
-    }
-
-    enable_external_route = False
-    enable_auth = False
-
-    if hasattr(request, "param"):
-        enable_external_route = request.param.get("enable-external-route")
-        enable_auth = request.param.get("enable-auth")
-        if supported_model_formats := request.param.get("supported-model-formats"):
-            runtime_kwargs["supported_model_formats"] = supported_model_formats
-
-        if runtime_image := request.param.get("runtime-image"):
-            runtime_kwargs["runtime_image"] = runtime_image
-
-    runtime_kwargs["enable_external_route"] = enable_external_route
-    runtime_kwargs["enable_auth"] = enable_auth
-
-    with ServingRuntimeFromTemplate(**runtime_kwargs) as model_runtime:
-        yield model_runtime
-
-
-@pytest.fixture(scope="class")
 def ovms_kserve_serving_runtime(
     request: FixtureRequest,
     unprivileged_client: DynamicClient,
@@ -303,19 +327,6 @@ def ci_endpoint_s3_secret(
         aws_s3_endpoint=ci_s3_bucket_endpoint,
     ) as secret:
         yield secret
-
-
-@pytest.fixture(scope="class")
-def ci_service_account(
-    unprivileged_client: DynamicClient, ci_endpoint_s3_secret: Secret
-) -> Generator[ServiceAccount, Any, Any]:
-    with ServiceAccount(
-        client=unprivileged_client,
-        namespace=ci_endpoint_s3_secret.namespace,
-        name="ci-models-bucket-sa",
-        secrets=[{"name": ci_endpoint_s3_secret.name}],
-    ) as sa:
-        yield sa
 
 
 @pytest.fixture(scope="class")
@@ -387,30 +398,6 @@ def ovms_raw_inference_service(
 
 
 @pytest.fixture(scope="class")
-def http_s3_tensorflow_model_mesh_inference_service(
-    request: FixtureRequest,
-    unprivileged_client: DynamicClient,
-    unprivileged_model_namespace: Namespace,
-    http_s3_ovms_model_mesh_serving_runtime: ServingRuntime,
-    ci_endpoint_s3_secret: Secret,
-    ci_service_account: ServiceAccount,
-) -> Generator[InferenceService, Any, Any]:
-    with create_isvc(
-        client=unprivileged_client,
-        name=f"{Protocols.HTTP}-{ModelFormat.TENSORFLOW}",
-        namespace=unprivileged_model_namespace.name,
-        runtime=http_s3_ovms_model_mesh_serving_runtime.name,
-        model_service_account=ci_service_account.name,
-        storage_key=ci_endpoint_s3_secret.name,
-        storage_path=request.param["model-path"],
-        model_format=ModelFormat.TENSORFLOW,
-        deployment_mode=KServeDeploymentType.MODEL_MESH,
-        model_version="2",
-    ) as isvc:
-        yield isvc
-
-
-@pytest.fixture(scope="class")
 def user_workload_monitoring_config_map(
     admin_client: DynamicClient, cluster_monitoring_config: ConfigMap
 ) -> Generator[ConfigMap, None, None]:
@@ -440,138 +427,153 @@ def user_workload_monitoring_config_map(
 
 
 @pytest.fixture(scope="class")
-def http_s3_ovms_external_route_model_mesh_serving_runtime(
+def model_car_inference_service(
     request: FixtureRequest,
     unprivileged_client: DynamicClient,
     unprivileged_model_namespace: Namespace,
-) -> Generator[ServingRuntime, Any, Any]:
-    runtime_kwargs = {
-        "client": unprivileged_client,
-        "namespace": unprivileged_model_namespace.name,
-        "name": f"{Protocols.HTTP}-{ModelInferenceRuntime.OPENVINO_RUNTIME}-exposed",
-        "template_name": RuntimeTemplates.OVMS_MODEL_MESH,
-        "multi_model": True,
-        "protocol": Protocols.REST.upper(),
-        "resources": {
-            ModelFormat.OVMS: {
-                "requests": {"cpu": "1", "memory": "4Gi"},
-                "limits": {"cpu": "2", "memory": "8Gi"},
-            },
-        },
-        "enable_external_route": True,
-    }
-
-    if hasattr(request, "param"):
-        runtime_kwargs["enable_auth"] = request.param.get("enable-auth")
-
-    with ServingRuntimeFromTemplate(**runtime_kwargs) as model_runtime:
-        yield model_runtime
-
-
-@pytest.fixture(scope="class")
-def http_s3_openvino_second_model_mesh_inference_service(
-    request: FixtureRequest,
-    unprivileged_client: DynamicClient,
-    unprivileged_model_namespace: Namespace,
-    ci_endpoint_s3_secret: Secret,
-    ci_service_account: ServiceAccount,
+    serving_runtime_from_template: ServingRuntime,
 ) -> Generator[InferenceService, Any, Any]:
-    # Dynamically select the used ServingRuntime by passing "runtime-fixture-name" request.param
-    runtime = request.getfixturevalue(argname=request.param["runtime-fixture-name"])
+    deployment_mode = request.param.get("deployment-mode", KServeDeploymentType.RAW_DEPLOYMENT)
     with create_isvc(
         client=unprivileged_client,
-        name=f"{Protocols.HTTP}-{ModelFormat.OPENVINO}-2",
+        name=f"model-car-{deployment_mode.lower()}",
         namespace=unprivileged_model_namespace.name,
-        runtime=runtime.name,
-        model_service_account=ci_service_account.name,
-        storage_key=ci_endpoint_s3_secret.name,
-        storage_path=request.param["model-path"],
-        model_format=request.param["model-format"],
-        deployment_mode=KServeDeploymentType.MODEL_MESH,
-        model_version=request.param["model-version"],
+        runtime=serving_runtime_from_template.name,
+        storage_uri=request.param["storage-uri"],
+        model_format=serving_runtime_from_template.instance.spec.supportedModelFormats[0].name,
+        deployment_mode=deployment_mode,
+        external_route=request.param.get("external-route", True),
+        wait_for_predictor_pods=False,
     ) as isvc:
         yield isvc
 
 
+# Kueue Fixtures
+def _is_kueue_operator_installed(admin_client: DynamicClient) -> bool:
+    try:
+        csvs = list(
+            ClusterServiceVersion.get(
+                dyn_client=admin_client,
+                namespace=py_config.get("applications_namespace", "openshift-operators"),
+            )
+        )
+        for csv in csvs:
+            if csv.name.startswith("kueue") and csv.status == csv.Status.SUCCEEDED:
+                LOGGER.info(f"Found Kueue operator CSV: {csv.name}")
+                return True
+        return False
+    except ResourceNotFoundError:
+        return False
+
+
+@pytest.fixture(scope="session")
+def ensure_kueue_unmanaged_in_dsc(
+    admin_client: DynamicClient, dsc_resource: DataScienceCluster
+) -> Generator[None, Any, None]:
+    try:
+        if not _is_kueue_operator_installed(admin_client):
+            pytest.skip("Kueue operator is not installed, skipping Kueue tests")
+
+        dsc_resource.get()
+        kueue_management_state = dsc_resource.instance.spec.components[DscComponents.KUEUE].managementState
+
+        if kueue_management_state == DscComponents.ManagementState.UNMANAGED:
+            LOGGER.info("Kueue is already Unmanaged in DSC, proceeding with tests")
+            yield
+        else:
+            LOGGER.info(f"Kueue management state is {kueue_management_state}, updating to Unmanaged")
+            dsc_dict = {
+                "spec": {
+                    "components": {DscComponents.KUEUE: {"managementState": DscComponents.ManagementState.UNMANAGED}}
+                }
+            }
+
+            with ResourceEditor(patches={dsc_resource: dsc_dict}):
+                LOGGER.info("Updated Kueue to Unmanaged, waiting for DSC to be ready")
+                dsc_resource.wait_for_condition(condition="Ready", status="True", timeout=300)
+                LOGGER.info("DSC is ready, proceeding with tests")
+                yield
+
+            LOGGER.info(f"Restoring Kueue management state to {kueue_management_state}")
+            restore_dict = {"spec": {"components": {DscComponents.KUEUE: {"managementState": kueue_management_state}}}}
+            with ResourceEditor(patches={dsc_resource: restore_dict}):
+                dsc_resource.wait_for_condition(condition="Ready", status="True", timeout=300)
+                LOGGER.info("Restored Kueue management state")
+
+    except (AttributeError, KeyError) as e:
+        pytest.skip(f"Kueue component not found in DSC: {e}")
+
+
+def kueue_resource_groups(
+    flavor_name: str,
+    cpu_quota: int,
+    memory_quota: str,
+) -> list[Dict[str, Any]]:
+    return [
+        {
+            "coveredResources": ["cpu", "memory"],
+            "flavors": [
+                {
+                    "name": flavor_name,
+                    "resources": [
+                        {"name": "cpu", "nominalQuota": cpu_quota},
+                        {"name": "memory", "nominalQuota": memory_quota},
+                    ],
+                }
+            ],
+        }
+    ]
+
+
 @pytest.fixture(scope="class")
-def unprivileged_s3_caikit_raw_inference_service(
+def kueue_cluster_queue_from_template(
     request: FixtureRequest,
-    unprivileged_client: DynamicClient,
-    unprivileged_model_namespace: Namespace,
-    unprivileged_s3_caikit_serving_runtime: ServingRuntime,
-    unprivileged_models_endpoint_s3_secret: Secret,
-) -> Generator[InferenceService, Any, Any]:
-    with create_isvc(
-        client=unprivileged_client,
-        name=f"{Protocols.HTTP}-{ModelFormat.CAIKIT}-raw",
-        namespace=unprivileged_model_namespace.name,
-        runtime=unprivileged_s3_caikit_serving_runtime.name,
-        model_format=unprivileged_s3_caikit_serving_runtime.instance.spec.supportedModelFormats[0].name,
-        deployment_mode=KServeDeploymentType.RAW_DEPLOYMENT,
-        storage_key=unprivileged_models_endpoint_s3_secret.name,
-        storage_path=ModelStoragePath.FLAN_T5_SMALL_CAIKIT,
-    ) as isvc:
-        yield isvc
-
-
-@pytest.fixture(scope="class")
-def unprivileged_s3_caikit_serving_runtime(
     admin_client: DynamicClient,
-    unprivileged_client: DynamicClient,
-    unprivileged_model_namespace: Namespace,
-) -> Generator[ServingRuntime, Any, Any]:
-    with ServingRuntimeFromTemplate(
+    ensure_kueue_unmanaged_in_dsc,
+) -> Generator[ClusterQueue, Any, None]:
+    if request.param.get("name") is None:
+        raise ValueError("name is required")
+    with create_cluster_queue(
+        name=request.param.get("name"),
         client=admin_client,
-        unprivileged_client=unprivileged_client,
-        name=f"{Protocols.HTTP}-{ModelInferenceRuntime.CAIKIT_TGIS_RUNTIME}",
-        namespace=unprivileged_model_namespace.name,
-        template_name=RuntimeTemplates.CAIKIT_TGIS_SERVING,
-        multi_model=False,
-        enable_http=True,
-        enable_grpc=False,
-    ) as model_runtime:
-        yield model_runtime
+        resource_groups=kueue_resource_groups(
+            request.param.get("resource_flavor_name"), request.param.get("cpu_quota"), request.param.get("memory_quota")
+        ),
+        namespace_selector=request.param.get("namespace_selector", {}),
+    ) as cluster_queue:
+        yield cluster_queue
 
 
 @pytest.fixture(scope="class")
-def unprivileged_models_endpoint_s3_secret(
-    unprivileged_client: DynamicClient,
-    unprivileged_model_namespace: Namespace,
-    aws_access_key_id: str,
-    aws_secret_access_key: str,
-    models_s3_bucket_name: str,
-    models_s3_bucket_region: str,
-    models_s3_bucket_endpoint: str,
-) -> Generator[Secret, Any, Any]:
-    with s3_endpoint_secret(
-        client=unprivileged_client,
-        name="models-bucket-secret",
-        namespace=unprivileged_model_namespace.name,
-        aws_access_key=aws_access_key_id,
-        aws_secret_access_key=aws_secret_access_key,
-        aws_s3_region=models_s3_bucket_region,
-        aws_s3_bucket=models_s3_bucket_name,
-        aws_s3_endpoint=models_s3_bucket_endpoint,
-    ) as secret:
-        yield secret
-
-
-@pytest.fixture(scope="class")
-def unprivileged_s3_caikit_serverless_inference_service(
+def kueue_resource_flavor_from_template(
     request: FixtureRequest,
-    unprivileged_client: DynamicClient,
+    admin_client: DynamicClient,
+    ensure_kueue_unmanaged_in_dsc,
+) -> Generator[ResourceFlavor, Any, None]:
+    if request.param.get("name") is None:
+        raise ValueError("name is required")
+    with create_resource_flavor(
+        name=request.param.get("name"),
+        client=admin_client,
+    ) as resource_flavor:
+        yield resource_flavor
+
+
+@pytest.fixture(scope="class")
+def kueue_local_queue_from_template(
+    request: FixtureRequest,
     unprivileged_model_namespace: Namespace,
-    unprivileged_s3_caikit_serving_runtime: ServingRuntime,
-    unprivileged_models_endpoint_s3_secret: Secret,
-) -> Generator[InferenceService, Any, Any]:
-    with create_isvc(
-        client=unprivileged_client,
-        name=f"{Protocols.HTTP}-{ModelFormat.CAIKIT}",
+    admin_client: DynamicClient,
+    ensure_kueue_unmanaged_in_dsc,
+) -> Generator[LocalQueue, Any, None]:
+    if request.param.get("name") is None:
+        raise ValueError("name is required")
+    if request.param.get("cluster_queue") is None:
+        raise ValueError("cluster_queue is required")
+    with create_local_queue(
+        name=request.param.get("name"),
         namespace=unprivileged_model_namespace.name,
-        runtime=unprivileged_s3_caikit_serving_runtime.name,
-        model_format=unprivileged_s3_caikit_serving_runtime.instance.spec.supportedModelFormats[0].name,
-        deployment_mode=KServeDeploymentType.SERVERLESS,
-        storage_key=unprivileged_models_endpoint_s3_secret.name,
-        storage_path=request.param["model-dir"],
-    ) as isvc:
-        yield isvc
+        cluster_queue=request.param.get("cluster_queue"),
+        client=admin_client,
+    ) as local_queue:
+        yield local_queue

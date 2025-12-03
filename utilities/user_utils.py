@@ -3,15 +3,16 @@ import shlex
 import tempfile
 from dataclasses import dataclass
 
+import requests
+from kubernetes.dynamic import DynamicClient
 from ocp_resources.user import User
 from pyhelper_utils.shell import run_command
 from timeout_sampler import retry
 
 from utilities.exceptions import ExceptionUserLogin
-from utilities.infra import login_with_user_password
+from utilities.infra import login_with_user_password, get_cluster_authentication
 import base64
 from pathlib import Path
-
 
 LOGGER = logging.getLogger(__name__)
 SLEEP_TIME = 5
@@ -28,6 +29,7 @@ class UserTestSession:
     password: str
     original_user: str
     api_server_url: str
+    is_byoidc: bool = False
 
     def __post_init__(self) -> None:
         """Validate the session data after initialization."""
@@ -85,9 +87,52 @@ def wait_for_user_creation(username: str, password: str, cluster_url: str) -> bo
     Returns:
         True if login is successful
     """
+    # not executed in byoidc mode
     LOGGER.info(f"Attempting to login as {username}")
     res = login_with_user_password(api_address=cluster_url, user=username, password=password)
 
     if res:
         return True
     raise ExceptionUserLogin(f"Could not login as user {username}.")
+
+
+def get_oidc_tokens(admin_client: DynamicClient, username: str, password: str) -> tuple[str, str]:
+    url = f"{get_byoidc_issuer_url(admin_client=admin_client)}/protocol/openid-connect/token"
+    headers = {"Content-Type": "application/x-www-form-urlencoded", "User-Agent": "python-requests"}
+
+    data = {
+        "username": username,
+        "password": password,
+        "grant_type": "password",
+        "client_id": "oc-cli",
+        "scope": "openid",
+    }
+
+    try:
+        LOGGER.info(f"Requesting token for user {username} in byoidc environment")
+        response = requests.post(
+            url=url,
+            headers=headers,
+            data=data,
+            allow_redirects=True,
+            timeout=30,
+            verify=True,  # Set to False if you need to skip SSL verification
+        )
+        response.raise_for_status()
+        json_response = response.json()
+
+        # Validate that we got an access token
+        if "id_token" not in json_response or "refresh_token" not in json_response:
+            LOGGER.error("Warning: No id_token or refresh_token in response")
+            raise AssertionError(f"No id_token or refresh_token in response: {json_response}")
+        return json_response["id_token"], json_response["refresh_token"]
+    except Exception as e:
+        raise e
+
+
+def get_byoidc_issuer_url(admin_client: DynamicClient) -> str:
+    authentication = get_cluster_authentication(admin_client=admin_client)
+    assert authentication is not None
+    url = authentication.instance.spec.oidcProviders[0].issuer.issuerURL
+    assert url is not None
+    return url

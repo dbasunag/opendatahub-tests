@@ -1,7 +1,11 @@
 import pytest
 from typing import List
 
-
+from tests.model_explainability.lm_eval.constants import (
+    LLMAAJ_TASK_DATA,
+    CUSTOM_UNITXT_TASK_DATA,
+    ARC_EASY_DATASET_IMAGE,
+)
 from tests.model_explainability.utils import validate_tai_component_images
 
 from tests.model_explainability.lm_eval.utils import get_lmeval_tasks, validate_lmeval_job_pod_and_logs
@@ -29,34 +33,13 @@ TIER2_LMEVAL_TASKS: List[str] = list(
         ),
         pytest.param(
             {"name": "test-lmeval-hf-custom-task"},
-            {
-                "task_list": {
-                    "custom": {
-                        "systemPrompts": [
-                            {"name": "sp_0", "value": "Be concise. At every point give the shortest acceptable answer."}
-                        ],
-                        "templates": [
-                            {
-                                "name": "tp_0",
-                                "value": '{ "__type__": "input_output_template", '
-                                '"input_format": "{text_a_type}: {text_a}\\n'
-                                '{text_b_type}: {text_b}", '
-                                '"output_format": "{label}", '
-                                '"target_prefix": '
-                                '"The {type_of_relation} class is ", '
-                                '"instruction": "Given a {text_a_type} and {text_b_type} '
-                                'classify the {type_of_relation} of the {text_b_type} to one of {classes}.",'
-                                ' "postprocessors": [ "processors.take_first_non_empty_line",'
-                                ' "processors.lower_case_till_punc" ] }',
-                            }
-                        ],
-                    },
-                    "taskRecipes": [
-                        {"card": {"name": "cards.wnli"}, "systemPrompt": {"ref": "sp_0"}, "template": {"ref": "tp_0"}}
-                    ],
-                }
-            },
+            CUSTOM_UNITXT_TASK_DATA,
             id="custom_task",
+        ),
+        pytest.param(
+            {"name": "test-lmeval-hf-llmaaj"},
+            LLMAAJ_TASK_DATA,
+            id="llmaaj_task",
         ),
     ],
     indirect=True,
@@ -72,10 +55,7 @@ def test_lmeval_huggingface_model(admin_client, model_namespace, lmevaljob_hf_po
     [
         pytest.param(
             {"name": "test-lmeval-local-offline-builtin"},
-            {
-                "image": "quay.io/trustyai_testing/lmeval-assets-flan-arceasy"
-                "@sha256:11cc9c2f38ac9cc26c4fab1a01a8c02db81c8f4801b5d2b2b90f90f91b97ac98"
-            },
+            {"dataset_image": ARC_EASY_DATASET_IMAGE},
             {"task_list": {"taskNames": ["arc_easy"]}},
         )
     ],
@@ -98,8 +78,8 @@ def test_lmeval_local_offline_builtin_tasks_flan_arceasy(
         pytest.param(
             {"name": "test-lmeval-local-offline-unitxt"},
             {
-                "image": "quay.io/trustyai_testing/lmeval-assets-flan-20newsgroups"
-                "@sha256:3778c15079f11ef338a82ee35ae1aa43d6db52bac7bbfdeab343ccabe2608a0c"
+                "dataset_image": "quay.io/trustyai_testing/lmeval-assets-20newsgroups"
+                "@sha256:106023a7ee0c93afad5d27ae50130809ccc232298b903c8b12ea452e9faafce2"
             },
             {
                 "task_list": {
@@ -134,6 +114,7 @@ def test_lmeval_local_offline_unitxt_tasks_flan_20newsgroups(
     ],
     indirect=True,
 )
+@pytest.mark.usefixtures("patched_dsc_kserve_headed")
 def test_lmeval_vllm_emulator(admin_client, model_namespace, lmevaljob_vllm_emulator_pod):
     """Basic test that verifies LMEval works with vLLM using a vLLM emulator for more efficient evaluation"""
     validate_lmeval_job_pod_and_logs(lmevaljob_pod=lmevaljob_vllm_emulator_pod)

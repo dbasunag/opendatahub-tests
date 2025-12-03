@@ -1,16 +1,13 @@
-import base64
 import json
 import os
 import re
 import shlex
 import stat
 import tarfile
-import tempfile
 import zipfile
 from contextlib import contextmanager
 from functools import cache
 from typing import Any, Generator, Optional, Set, Callable
-from json import JSONDecodeError
 
 import kubernetes
 import platform
@@ -24,6 +21,8 @@ from kubernetes.dynamic.exceptions import (
     NotFoundError,
     ResourceNotFoundError,
 )
+
+from ocp_resources.authentication_config_openshift_io import Authentication
 from ocp_resources.catalog_source import CatalogSource
 from ocp_resources.cluster_service_version import ClusterServiceVersion
 from ocp_resources.config_map import ConfigMap
@@ -66,6 +65,7 @@ from utilities.exceptions import ClusterLoginError, FailedPodsError, ResourceNot
 from timeout_sampler import TimeoutExpiredError, TimeoutSampler, TimeoutWatch, retry
 import utilities.general
 from ocp_resources.utils.constants import DEFAULT_CLUSTER_RETRY_EXCEPTIONS
+from utilities.general import generate_random_name
 
 LOGGER = get_logger(name=__name__)
 
@@ -82,6 +82,7 @@ def create_ns(
     model_mesh_enabled: bool = False,
     add_dashboard_label: bool = False,
     add_kueue_label: bool = False,
+    randomize_name: bool = False,
     pytest_request: FixtureRequest | None = None,
 ) -> Generator[Namespace | Project, Any, Any]:
     """
@@ -107,6 +108,8 @@ def create_ns(
         add_dashboard_label (bool): if True, dashboard label will be added to namespace
             Can be overwritten by `request.param["add-dashboard-label"]`
         pytest_request (FixtureRequest): pytest request
+        randomize_name (bool): if True, randomize the namespace name.
+            Can be overwritten by `request.param["randomize_name"]`
 
     Yields:
         Namespace | Project: namespace or project
@@ -118,6 +121,12 @@ def create_ns(
         model_mesh_enabled = pytest_request.param.get("modelmesh-enabled", model_mesh_enabled)
         add_dashboard_label = pytest_request.param.get("add-dashboard-label", add_dashboard_label)
         add_kueue_label = pytest_request.param.get("add-kueue-label", add_kueue_label)
+        randomize_name = pytest_request.param.get("randomize_name", randomize_name)
+
+    # Handle randomization
+    base_name = name or "test-namespace"
+    if randomize_name:
+        name = generate_random_name(prefix=base_name, length=4)
 
     namespace_kwargs = {
         "name": name,
@@ -593,7 +602,7 @@ def get_pods_by_isvc_label(client: DynamicClient, isvc: InferenceService, runtim
     raise ResourceNotFoundError(f"{isvc.name} has no pods")
 
 
-def get_openshift_token() -> str:
+def get_openshift_token(client: DynamicClient | None = None) -> str:
     """
     Get the OpenShift token.
 
@@ -601,7 +610,13 @@ def get_openshift_token() -> str:
         str: The OpenShift token.
 
     """
-    return run_command(command=shlex.split("oc whoami -t"))[1].strip()
+    client = client or get_client()
+    LOGGER.info("Getting OpenShift token")
+    bearer_str = client.configuration.api_key["authorization"]
+    assert bearer_str, "No OpenShift token found from client instance"
+    match = re.search(r"Bearer (.+)", bearer_str)
+    assert match, "No OpenShift token found"
+    return match.group(1)
 
 
 def get_kserve_storage_initialize_image(client: DynamicClient) -> str:
@@ -1025,15 +1040,6 @@ def get_rhods_operator_installed_csv() -> ClusterServiceVersion | None:
     return None
 
 
-def get_rhods_csv_version() -> Version | None:
-    rhoai_csv = get_rhods_operator_installed_csv()
-    if rhoai_csv:
-        LOGGER.info(f"RHOAI CSV version: {rhoai_csv.instance.spec.version}")
-        return Version.parse(version=rhoai_csv.instance.spec.version)
-    LOGGER.warning("No RHOAI CSV found. Potentially ODH cluster")
-    return None
-
-
 @retry(
     wait_timeout=120,
     sleep=5,
@@ -1113,56 +1119,6 @@ def verify_cluster_sanity(
 
         # TODO: Write to file to easily report the failure in jenkins
         pytest.exit(reason=error_msg, returncode=return_code)
-
-
-def get_openshift_pull_secret(client: DynamicClient = None) -> Secret:
-    openshift_config_namespace = "openshift-config"
-    pull_secret_name = "pull-secret"  # pragma: allowlist secret
-    secret = Secret(
-        client=client or get_client(),
-        name=pull_secret_name,
-        namespace=openshift_config_namespace,
-    )
-    assert secret.exists, f"Pull-secret {pull_secret_name} not found in namespace {openshift_config_namespace}"
-    return secret
-
-
-def generate_openshift_pull_secret_file(client: DynamicClient = None) -> str:
-    pull_secret = get_openshift_pull_secret(client=client)
-    pull_secret_path = tempfile.mkdtemp(suffix="odh-pull-secret")
-    json_file = os.path.join(pull_secret_path, "pull-secrets.json")
-    secret = base64.b64decode(pull_secret.instance.data[".dockerconfigjson"]).decode(encoding="utf-8")
-    with open(file=json_file, mode="w") as outfile:
-        outfile.write(secret)
-    return json_file
-
-
-def get_oc_image_info(
-    image: str,
-    architecture: str,
-    pull_secret: str | None = None,
-) -> Any:
-    def _get_image_json(cmd: str) -> Any:
-        return json.loads(run_command(command=shlex.split(cmd), check=False)[1])
-
-    base_command = f"oc image -o json info {image} --filter-by-os {architecture}"
-    if pull_secret:
-        base_command = f"{base_command} --registry-config={pull_secret}"
-
-    sample = None
-    try:
-        for sample in TimeoutSampler(
-            wait_timeout=10,
-            sleep=5,
-            exceptions_dict={JSONDecodeError: [], TypeError: []},
-            func=_get_image_json,
-            cmd=base_command,
-        ):
-            if sample:
-                return sample
-    except TimeoutExpiredError:
-        LOGGER.error(f"Failed to parse {base_command}")
-        raise
 
 
 def get_machine_platform() -> str:
@@ -1254,3 +1210,10 @@ def check_internal_image_registry_available(admin_client: DynamicClient) -> bool
     except (ResourceNotFoundError, Exception) as e:
         LOGGER.warning(f"Failed to check image registry config: {e}")
         return False
+
+
+def get_cluster_authentication(admin_client: DynamicClient) -> Authentication | None:
+    auth = Authentication(client=admin_client, name="cluster")
+    if auth.exists:
+        return auth
+    return None

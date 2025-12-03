@@ -41,6 +41,21 @@ OC_BINARY_PATH=/usr/local/bin/oc uv run pytest
 
 **Note:** Ensure your local `oc` binary is executable and compatible with your target cluster version.
 
+## Must gather
+
+In order to collect must-gather on failure point one may use `--collect-must-gather` to the pytest command. e.g.
+
+```bash
+uv run pytest tests/<your component> --collect-must-gather
+```
+
+By default, the collected must-gather would be archived. To skip archiving, please set environment variable
+ARCHIVE_MUST_GATHER to any value other than "true". e.g.
+
+```bash
+export ARCHIVE_MUST_GATHER="false"
+```
+
 ### Benefits of Using Local Binary
 
 - Faster test startup (no download time)
@@ -79,10 +94,20 @@ uv run pytest -c custom-pytest.ini
 
 ```
 
+### Turning off console logging
+By default, pytest will output logging reports in the console. You can disable this behavior with `-o log_cli=false`
+
+```bash
+uv run pytest -o log_cli=false
+```
+
 ### Running specific tests
 ```bash
 uv run pytest -k test_name
 ```
+
+### LlamaStack Integration Tests
+For more information about LlamaStack integration tests, see [/tests/llama_stack/README.md](../tests/llama_stack/README.md).
 
 ### Running on different distributions
 Bt default, RHOAI distribution is set.  
@@ -92,13 +117,6 @@ To run on ODH, pass `--tc=distribution:upstream` to pytest.
 By default, cluster sanity checks are run to make cluster ready for tests.
 To skip cluster sanity checks, pass `--cluster-sanity-skip-check` to skip all tests.
 To skip RHOAI/ODH-related tests (for example when running in upstream), pass `--cluster-sanity-skip-rhoai-check`.
-
-### Check dependent operators
-By default, `Serveless` (serverless-operator), `Authorino` (authorino-operator) and `Service Mesh` (servicemeshoperator) operators are checked to be installed when  
-running model server Serverless tests.
-To check only specific operator, pass `--tc=dependent_operators:<operator_name>` to pytest.
-For example, to check only `Serveless` and `Service Mesh` operators, pass `--tc=dependent_operators:serverless-operator,servicemeshoperator`.
-
 
 ### Running tests with admin client instead of unprivileged client
 To run tests with admin client only, pass `--tc=use_unprivileged_client:False` to pytest.

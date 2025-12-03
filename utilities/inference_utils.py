@@ -462,10 +462,14 @@ class UserInference(Inference):
                 from_port=port,
                 to_port=port,
             ):
-                res, out, err = run_command(command=shlex.split(cmd), verify_stderr=False, check=False)
+                res, out, err = run_command(
+                    command=shlex.split(cmd), verify_stderr=False, check=False, hide_log_command=True
+                )
 
         else:
-            res, out, err = run_command(command=shlex.split(cmd), verify_stderr=False, check=False)
+            res, out, err = run_command(
+                command=shlex.split(cmd), verify_stderr=False, check=False, hide_log_command=True
+            )
 
         if res:
             if f"http/1.0 {HTTPStatus.SERVICE_UNAVAILABLE}" in out.lower():
@@ -475,7 +479,8 @@ class UserInference(Inference):
                 )
 
         else:
-            raise ValueError(f"Inference failed with error: {err}\nOutput: {out}\nCommand: {cmd}")
+            sanitized_cmd = re.sub(r"('Authorization: Bearer ).*?(')", r"\1***REDACTED***2", cmd)
+            raise ValueError(f"Inference failed with error: {err}\nOutput: {out}\nCommand: {sanitized_cmd}")
 
         LOGGER.info(f"Inference output:\n{out}")
 
@@ -578,6 +583,7 @@ def create_isvc(
     protocol_version: str | None = None,
     labels: dict[str, str] | None = None,
     auto_scaling: dict[str, Any] | None = None,
+    scheduler_name: str | None = None,
 ) -> Generator[InferenceService, Any, Any]:
     """
     Create InferenceService object.
@@ -613,6 +619,7 @@ def create_isvc(
         teardown (bool): Teardown
         protocol_version (str): Protocol version of the model server
         auto_scaling (dict[str, Any]): Auto scaling configuration for the model
+        scheduler_name (str): Scheduler name
 
     Yields:
         InferenceService: InferenceService object
@@ -638,7 +645,8 @@ def create_isvc(
     if model_version:
         predictor_dict["model"]["modelFormat"]["version"] = model_version
 
-    _check_storage_arguments(storage_uri=storage_uri, storage_key=storage_key, storage_path=storage_path)
+    if storage_uri or storage_path or storage_key:
+        _check_storage_arguments(storage_uri=storage_uri, storage_key=storage_key, storage_path=storage_path)
     if storage_uri:
         predictor_dict["model"]["storageUri"] = storage_uri
     elif storage_key:
@@ -706,6 +714,9 @@ def create_isvc(
     if protocol_version is not None:
         predictor_dict["model"]["protocolVersion"] = protocol_version
 
+    if scheduler_name is not None:
+        predictor_dict["schedulerName"] = scheduler_name
+
     with InferenceService(
         client=client,
         name=name,
@@ -757,6 +768,21 @@ def create_isvc(
                 status=inference_service.Condition.Status.TRUE,
                 timeout=timeout_watch.remaining_time(),
             )
+
+            # After the InferenceService reports Ready, the backing model should be fully loaded and up to date,
+            # when modelStatus is reported by the runtime.
+            model_status = getattr(inference_service.instance.status, "modelStatus", None)
+            if model_status and getattr(model_status, "states", None):
+                active_state = model_status.states.activeModelState
+                target_state = model_status.states.targetModelState
+                transition_status = model_status.transitionStatus
+                if not (active_state == "Loaded" and target_state == "Loaded" and transition_status == "UpToDate"):
+                    raise AssertionError(
+                        "InferenceService modelStatus is not in Loaded/UpToDate state. "
+                        f"activeModelState={active_state!r}, "
+                        f"targetModelState={target_state!r}, "
+                        f"transitionStatus={transition_status!r}"
+                    )
 
         yield inference_service
 

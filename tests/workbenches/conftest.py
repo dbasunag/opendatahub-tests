@@ -7,17 +7,17 @@ from simple_logger.logger import get_logger
 from tests.workbenches.utils import get_username
 
 from kubernetes.dynamic import DynamicClient
-from kubernetes.dynamic.exceptions import ResourceNotFoundError
 
 from ocp_resources.namespace import Namespace
 from ocp_resources.persistent_volume_claim import PersistentVolumeClaim
-from ocp_resources.route import Route
 from ocp_resources.notebook import Notebook
+from ocp_resources.pod import Pod
 
-from utilities.constants import Labels
+from utilities.constants import Labels, Timeout
 from utilities import constants
 from utilities.constants import INTERNAL_IMAGE_REGISTRY_PATH
 from utilities.infra import check_internal_image_registry_available
+from utilities.general import collect_pod_information
 
 LOGGER = get_logger(name=__name__)
 
@@ -42,38 +42,82 @@ def users_persistent_volume_claim(
 def minimal_image() -> Generator[str, None, None]:
     """Provides a full image name of a minimal workbench image"""
     image_name = "jupyter-minimal-notebook" if py_config.get("distribution") == "upstream" else "s2i-minimal-notebook"
-    yield f"{image_name}:{'2025.1'}"
+    yield f"{image_name}:{'2025.2'}"
+
+
+@pytest.fixture(scope="function")
+def notebook_image(
+    request: pytest.FixtureRequest,
+    admin_client: DynamicClient,
+    minimal_image: str,
+) -> str:
+    """
+    Resolves the notebook image path.
+
+    Priority:
+    1. 'custom_image' provided via indirect parametrization
+    2. Default 'minimal_image' (with automatic registry resolution)
+    """
+    # SAFELY get parameters. If test doesn't parameterize this fixture, default to empty dict.
+    params = getattr(request, "param", {})
+    custom_image = params.get("custom_image")
+
+    # Case A: Custom Image (Explicit)
+    if custom_image:
+        custom_image = custom_image.strip()
+        if not custom_image:
+            raise ValueError("custom_image cannot be empty or whitespace")
+
+        # Validation Logic: Only digest references are accepted
+        _ERR_INVALID_CUSTOM_IMAGE = (
+            "custom_image must be a valid OCI image reference with a digest (@sha256:digest), "
+            "e.g., 'quay.io/org/image@sha256:abc123...', "
+            "got: '{custom_image}'"
+        )
+        # Check for valid digest: @sha256: must be followed by non-empty content
+        digest_marker = "@sha256:"
+        has_valid_digest = False
+        if digest_marker in custom_image:
+            digest_index = custom_image.rfind(digest_marker)
+            digest_end = digest_index + len(digest_marker)
+            has_valid_digest = digest_end < len(custom_image)
+
+        if not has_valid_digest:
+            raise ValueError(_ERR_INVALID_CUSTOM_IMAGE.format(custom_image=custom_image))
+
+        LOGGER.info(f"Using custom workbench image: {custom_image}")
+        return custom_image
+
+    # Case B: Default Image (Implicit / Good Default)
+    # This runs for all standard tests in test_spawning.py
+    internal_image_registry = check_internal_image_registry_available(admin_client=admin_client)
+
+    return (
+        f"{INTERNAL_IMAGE_REGISTRY_PATH}/{py_config['applications_namespace']}/{minimal_image}"
+        if internal_image_registry
+        else minimal_image
+    )
 
 
 @pytest.fixture(scope="function")
 def default_notebook(
     request: pytest.FixtureRequest,
     admin_client: DynamicClient,
-    minimal_image: str,
+    notebook_image: str,
 ) -> Generator[Notebook, None, None]:
     """Returns a new Notebook CR for a given namespace, name, and image"""
     namespace = request.param["namespace"]
     name = request.param["name"]
 
-    # Set new Route url
-    route_name = "odh-dashboard" if py_config.get("distribution") == "upstream" else "rhods-dashboard"
-    route = Route(client=admin_client, name=route_name, namespace=py_config["applications_namespace"])
-    if not route.exists:
-        raise ResourceNotFoundError(f"Route {route.name} does not exist")
+    # Optional Auth annotations
+    auth_annotations = request.param.get("auth_annotations", {})
 
     # Set the correct username
     username = get_username(dyn_client=admin_client)
     assert username, "Failed to determine username from the cluster"
 
-    # Check internal image registry availability
-    internal_image_registry = check_internal_image_registry_available(admin_client=admin_client)
-
-    # Set the image path based on internal image registry status
-    minimal_image_path = (
-        f"{INTERNAL_IMAGE_REGISTRY_PATH}/{py_config['applications_namespace']}/{minimal_image}"
-        if internal_image_registry
-        else ":" + minimal_image.rsplit(":", maxsplit=1)[1]
-    )
+    # Set the image path based on the resolved notebook_image
+    image_path = notebook_image
 
     probe_config = {
         "failureThreshold": 3,
@@ -93,16 +137,19 @@ def default_notebook(
         "kind": "Notebook",
         "metadata": {
             "annotations": {
-                "notebooks.opendatahub.io/inject-oauth": "true",
+                Labels.Notebook.INJECT_AUTH: "true",
                 "opendatahub.io/accelerator-name": "",
-                "opendatahub.io/service-mesh": "false",
-                "notebooks.opendatahub.io/last-image-selection": minimal_image,
+                "notebooks.opendatahub.io/last-image-selection": image_path,
+                # Add any additional annotations if provided
+                **auth_annotations,
             },
+            "finalizers": [
+                "notebook.opendatahub.io/kube-rbac-proxy-cleanup",
+            ],
             "labels": {
                 Labels.Openshift.APP: name,
                 Labels.OpenDataHub.DASHBOARD: "true",
                 "opendatahub.io/odh-managed": "true",
-                "sidecar.istio.io/inject": "false",
             },
             "name": name,
             "namespace": namespace,
@@ -124,13 +171,11 @@ def default_notebook(
                                     "                  "
                                     f"--ServerApp.base_url=/notebook/{namespace}/{name}\n"
                                     "                  "
-                                    "--ServerApp.quit_button=False\n"
-                                    "                  "
-                                    f'--ServerApp.tornado_settings={{"user":"{username}","hub_host":"https://{route.host}","hub_prefix":"/projects/{namespace}"}}',  # noqa: E501 line too long
+                                    "--ServerApp.quit_button=False\n",
                                 },
-                                {"name": "JUPYTER_IMAGE", "value": minimal_image_path},
+                                {"name": "JUPYTER_IMAGE", "value": image_path},
                             ],
-                            "image": minimal_image_path,
+                            "image": image_path,
                             "imagePullPolicy": "Always",
                             "livenessProbe": probe_config,
                             "name": name,
@@ -146,55 +191,6 @@ def default_notebook(
                             ],
                             "workingDir": "/opt/app-root/src",
                         },
-                        {
-                            "args": [
-                                "--provider=openshift",
-                                "--https-address=:8443",
-                                "--http-address=",
-                                f"--openshift-service-account={name}",
-                                "--cookie-secret-file=/etc/oauth/config/cookie_secret",
-                                "--cookie-expire=24h0m0s",
-                                "--tls-cert=/etc/tls/private/tls.crt",
-                                "--tls-key=/etc/tls/private/tls.key",
-                                "--upstream=http://localhost:8888",
-                                "--upstream-ca=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
-                                "--email-domain=*",
-                                "--skip-provider-button",
-                                f'--openshift-sar={{"verb":"get","resource":"notebooks","resourceAPIGroup":"kubeflow.org","resourceName":"{name}","namespace":"$(NAMESPACE)"}}',  # noqa: E501 line too long
-                                f"--logout-url=https://{route.host}/projects/{namespace}?notebookLogout={name}",
-                            ],
-                            "env": [
-                                {"name": "NAMESPACE", "valueFrom": {"fieldRef": {"fieldPath": "metadata.namespace"}}}
-                            ],
-                            "image": "registry.redhat.io/openshift4/ose-oauth-proxy:v4.10",
-                            "imagePullPolicy": "Always",
-                            "livenessProbe": {
-                                "failureThreshold": 3,
-                                "httpGet": {"path": "/oauth/healthz", "port": "oauth-proxy", "scheme": "HTTPS"},
-                                "initialDelaySeconds": 30,
-                                "periodSeconds": 5,
-                                "successThreshold": 1,
-                                "timeoutSeconds": 1,
-                            },
-                            "name": "oauth-proxy",
-                            "ports": [{"containerPort": 8443, "name": "oauth-proxy", "protocol": "TCP"}],
-                            "readinessProbe": {
-                                "failureThreshold": 3,
-                                "httpGet": {"path": "/oauth/healthz", "port": "oauth-proxy", "scheme": "HTTPS"},
-                                "initialDelaySeconds": 5,
-                                "periodSeconds": 5,
-                                "successThreshold": 1,
-                                "timeoutSeconds": 1,
-                            },
-                            "resources": {
-                                "limits": {"cpu": "100m", "memory": "64Mi"},
-                                "requests": {"cpu": "100m", "memory": "64Mi"},
-                            },
-                            "volumeMounts": [
-                                {"mountPath": "/etc/oauth/config", "name": "oauth-config"},
-                                {"mountPath": "/etc/tls/private", "name": "tls-certificates"},
-                            ],
-                        },
                     ],
                     "enableServiceLinks": False,
                     "serviceAccountName": name,
@@ -202,10 +198,16 @@ def default_notebook(
                         {"name": name, "persistentVolumeClaim": {"claimName": name}},
                         {"emptyDir": {"medium": "Memory"}, "name": "shm"},
                         {
-                            "name": "oauth-config",
-                            "secret": {"defaultMode": 420, "secretName": f"{name}-oauth-config"},
+                            "name": "kube-rbac-proxy-config",
+                            "configMap": {"defaultMode": 420, "name": "test-kube-rbac-proxy-config"},
                         },
-                        {"name": "tls-certificates", "secret": {"defaultMode": 420, "secretName": f"{name}-tls"}},
+                        {
+                            "name": "kube-rbac-proxy-tls-certificates",
+                            "secret": {
+                                "defaultMode": 420,
+                                "secretName": "test-kube-rbac-proxy-tls",  # pragma: allowlist secret
+                            },
+                        },
                     ],
                 }
             }
@@ -214,3 +216,70 @@ def default_notebook(
 
     with Notebook(kind_dict=notebook) as nb:
         yield nb
+
+
+@pytest.fixture(scope="function")
+def notebook_pod(
+    unprivileged_client: DynamicClient,
+    default_notebook: Notebook,
+) -> Pod:
+    """
+    Returns a notebook pod in Ready state.
+
+    This fixture:
+    - Creates a Pod object for the notebook
+    - Waits for pod to exist
+    - Waits for pod to reach Ready state (10-minute timeout)
+    - Provides detailed diagnostics on failure
+
+    Args:
+        unprivileged_client: Client for interacting with the cluster
+        default_notebook: The notebook CR to get the pod for
+
+    Returns:
+        Pod object in Ready state
+
+    Raises:
+        AssertionError: If pod fails to reach Ready state or is not created
+    """
+    # Error messages
+    _ERR_POD_NOT_READY = (
+        "Pod '{pod_name}-0' failed to reach Ready state within 10 minutes.\n"
+        "Pod Phase: {pod_phase}\n"
+        "Original Error: {original_error}\n"
+        "Pod information collected to must-gather directory for debugging."
+    )
+    _ERR_POD_NOT_CREATED = "Pod '{pod_name}-0' was not created. Check notebook controller logs."
+
+    # Create pod object
+    notebook_pod = Pod(
+        client=unprivileged_client,
+        namespace=default_notebook.namespace,
+        name=f"{default_notebook.name}-0",
+    )
+
+    try:
+        notebook_pod.wait()
+        notebook_pod.wait_for_condition(
+            condition=Pod.Condition.READY,
+            status=Pod.Condition.Status.TRUE,
+            timeout=Timeout.TIMEOUT_10MIN,
+        )
+    except (TimeoutError, RuntimeError) as e:
+        if notebook_pod.exists:
+            # Collect pod information for debugging purposes (YAML + logs saved to must-gather dir)
+            collect_pod_information(notebook_pod)
+            pod_status = notebook_pod.instance.status
+            pod_phase = pod_status.phase
+            raise AssertionError(
+                _ERR_POD_NOT_READY.format(
+                    pod_name=default_notebook.name,
+                    pod_phase=pod_phase,
+                    original_error=e,
+                )
+            ) from e
+        else:
+            # Pod was never created
+            raise AssertionError(_ERR_POD_NOT_CREATED.format(pod_name=default_notebook.name)) from e
+
+    return notebook_pod

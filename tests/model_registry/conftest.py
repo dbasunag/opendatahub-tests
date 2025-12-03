@@ -10,7 +10,10 @@ from pyhelper_utils.shell import run_command
 from typing import Generator, Any, List, Dict
 
 from ocp_resources.config_map import ConfigMap
+from ocp_resources.infrastructure import Infrastructure
+from ocp_resources.oauth import OAuth
 from ocp_resources.pod import Pod
+from ocp_resources.route import Route
 from ocp_resources.secret import Secret
 from ocp_resources.namespace import Namespace
 from ocp_resources.service import Service
@@ -21,6 +24,7 @@ from ocp_resources.persistent_volume_claim import PersistentVolumeClaim
 from ocp_resources.data_science_cluster import DataScienceCluster
 from ocp_resources.deployment import Deployment
 
+
 from ocp_resources.model_registry_modelregistry_opendatahub_io import ModelRegistry
 from ocp_resources.resource import ResourceEditor
 
@@ -29,10 +33,16 @@ from simple_logger.logger import get_logger
 from kubernetes.dynamic import DynamicClient
 from pytest_testconfig import config as py_config
 from model_registry.types import RegisteredModel
-from tests.model_registry.utils import generate_namespace_name
-from utilities.general import generate_random_name
 
-from tests.model_registry.utils import delete_model_catalog_configmap
+from utilities.general import wait_for_oauth_openshift_deployment
+from tests.model_registry.utils import (
+    generate_namespace_name,
+    get_rest_headers,
+    wait_for_default_resource_cleanedup,
+    get_byoidc_user_credentials,
+)
+
+from utilities.general import generate_random_name, wait_for_pods_running
 
 from tests.model_registry.constants import (
     MR_OPERATOR_NAME,
@@ -41,19 +51,21 @@ from tests.model_registry.constants import (
     DB_RESOURCE_NAME,
     MR_INSTANCE_NAME,
     MODEL_REGISTRY_POD_FILTER,
+    DEFAULT_CUSTOM_MODEL_CATALOG,
+    KUBERBACPROXY_STR,
 )
 from utilities.constants import Labels, Protocols
 from tests.model_registry.utils import (
     get_endpoint_from_mr_service,
     get_mr_service_by_label,
-    wait_for_pods_running,
     get_model_registry_objects,
     get_model_registry_metadata_resources,
 )
 from utilities.constants import DscComponents
 from model_registry import ModelRegistry as ModelRegistryClient
 from utilities.general import wait_for_pods_by_labels
-from utilities.infra import get_data_science_cluster
+from utilities.infra import get_data_science_cluster, wait_for_dsc_status_ready, login_with_user_password
+from utilities.user_utils import UserTestSession, wait_for_user_creation, create_htpasswd_file
 
 DEFAULT_TOKEN_DURATION = "10m"
 LOGGER = get_logger(name=__name__)
@@ -79,9 +91,9 @@ def model_registry_instance(
         mr_instance = ModelRegistry(name=MR_INSTANCE_NAME, namespace=model_registry_namespace, ensure_exists=True)
         yield [mr_instance]
         mr_instance.delete(wait=True)
-        delete_model_catalog_configmap(admin_client=admin_client, namespace=model_registry_namespace)
     else:
         LOGGER.warning("Requested Oauth Proxy configuration:")
+        db_name = param.get("db_name", "mysql")
         mr_objects = get_model_registry_objects(
             client=admin_client,
             namespace=model_registry_namespace,
@@ -89,20 +101,19 @@ def model_registry_instance(
             num=param.get("num_resources", 1),
             teardown_resources=teardown_resources,
             params=param,
-            db_backend=param.get("db_name", "mysql"),
+            db_backend=db_name,
         )
         with ExitStack() as stack:
             mr_instances = [stack.enter_context(mr_obj) for mr_obj in mr_objects]
             for mr_instance in mr_instances:
                 mr_instance.wait_for_condition(condition="Available", status="True")
-                mr_instance.wait_for_condition(condition="OAuthProxyAvailable", status="True")
+                mr_instance.wait_for_condition(condition=KUBERBACPROXY_STR, status="True")
                 wait_for_pods_running(
                     admin_client=admin_client, namespace_name=model_registry_namespace, number_of_consecutive_checks=6
                 )
             yield mr_instances
-
-        # since model catalog is associated with model registry instances, we need to clean up the config map manually
-        delete_model_catalog_configmap(admin_client=admin_client, namespace=model_registry_namespace)
+        if db_name == "default":
+            wait_for_default_resource_cleanedup(admin_client=admin_client, namespace_name=model_registry_namespace)
 
 
 @pytest.fixture(scope="class")
@@ -134,24 +145,27 @@ def model_registry_metadata_db_resources(
                 resource.delete(wait=True)
     else:
         resources_instances = {}
-        resources = get_model_registry_metadata_resources(
-            base_name=DB_BASE_RESOURCES_NAME,
-            namespace=model_registry_namespace,
-            num_resources=num_resources,
-            db_backend=db_backend,
-            teardown_resources=teardown_resources,
-            client=admin_client,
-        )
-        with ExitStack() as stack:
-            for kind_name in [Secret, PersistentVolumeClaim, Service, ConfigMap, Deployment]:
-                if resources[kind_name]:
-                    LOGGER.info(f"Creating {num_resources} {kind_name} resources")
-                    resources_instances[kind_name] = [
-                        stack.enter_context(resource_obj) for resource_obj in resources[kind_name]
-                    ]
-            for deployment in resources_instances[Deployment]:
-                deployment.wait_for_replicas(deployed=True)
+        if db_backend == "default":
             yield resources_instances
+        else:
+            resources = get_model_registry_metadata_resources(
+                base_name=DB_BASE_RESOURCES_NAME,
+                namespace=model_registry_namespace,
+                num_resources=num_resources,
+                db_backend=db_backend,
+                teardown_resources=teardown_resources,
+                client=admin_client,
+            )
+            with ExitStack() as stack:
+                for kind_name in [Secret, PersistentVolumeClaim, Service, ConfigMap, Deployment]:
+                    if resources[kind_name]:
+                        LOGGER.info(f"Creating {num_resources} {kind_name} resources")
+                        resources_instances[kind_name] = [
+                            stack.enter_context(resource_obj) for resource_obj in resources[kind_name]
+                        ]
+                for deployment in resources_instances[Deployment]:
+                    deployment.wait_for_replicas(deployed=True)
+                yield resources_instances
 
 
 @pytest.fixture(scope="class")
@@ -172,59 +186,74 @@ def model_registry_instance_rest_endpoint(admin_client: DynamicClient, model_reg
 @pytest.fixture(scope="session")
 def updated_dsc_component_state_scope_session(
     pytestconfig: Config,
-    request: FixtureRequest,
     admin_client: DynamicClient,
-    teardown_resources: bool,
 ) -> Generator[DataScienceCluster, Any, Any]:
     dsc_resource = get_data_science_cluster(client=admin_client)
-    if not teardown_resources or pytestconfig.option.post_upgrade:
-        # if we are not tearing down resources or we are in post upgrade, we don't need to do anything
-        # the pre_upgrade/post_upgrade fixtures will handle the rest
-        yield dsc_resource
-    else:
-        original_components = dsc_resource.instance.spec.components
-        component_patch = {
-            DscComponents.MODELREGISTRY: {
-                "managementState": DscComponents.ManagementState.MANAGED,
-                "registriesNamespace": py_config["model_registry_namespace"],
-            },
-        }
-        LOGGER.info(f"Applying patch {component_patch}")
-
-        with ResourceEditor(patches={dsc_resource: {"spec": {"components": component_patch}}}):
-            for component_name in component_patch:
-                dsc_resource.wait_for_condition(
-                    condition=DscComponents.COMPONENT_MAPPING[component_name], status="True"
+    original_namespace_name = dsc_resource.instance.spec.components.modelregistry.registriesNamespace
+    if pytestconfig.option.custom_namespace:
+        resource_editor = ResourceEditor(
+            patches={
+                dsc_resource: {
+                    "spec": {
+                        "components": {
+                            DscComponents.MODELREGISTRY: {
+                                "managementState": DscComponents.ManagementState.REMOVED,
+                                "registriesNamespace": original_namespace_name,
+                            },
+                        }
+                    }
+                }
+            }
+        )
+        try:
+            # first disable MR
+            resource_editor.update(backup_resources=True)
+            wait_for_dsc_status_ready(dsc_resource=dsc_resource)
+            # now delete the original namespace:
+            original_namespace = Namespace(name=original_namespace_name, wait_for_resource=True)
+            original_namespace.delete(wait=True)
+            # Now enable it with the custom namespace
+            with ResourceEditor(
+                patches={
+                    dsc_resource: {
+                        "spec": {
+                            "components": {
+                                DscComponents.MODELREGISTRY: {
+                                    "managementState": DscComponents.ManagementState.MANAGED,
+                                    "registriesNamespace": py_config["model_registry_namespace"],
+                                },
+                            }
+                        }
+                    }
+                }
+            ):
+                namespace = Namespace(name=py_config["model_registry_namespace"], wait_for_resource=True)
+                namespace.wait_for_status(status=Namespace.Status.ACTIVE)
+                wait_for_pods_running(
+                    admin_client=admin_client,
+                    namespace_name=py_config["applications_namespace"],
+                    number_of_consecutive_checks=6,
                 )
-            namespace = Namespace(name=py_config["model_registry_namespace"], wait_for_resource=True)
-            namespace.wait_for_status(status=Namespace.Status.ACTIVE)
+                wait_for_pods_running(
+                    admin_client=admin_client,
+                    namespace_name=py_config["model_registry_namespace"],
+                    number_of_consecutive_checks=6,
+                )
+                yield dsc_resource
+        finally:
+            resource_editor.restore()
+            Namespace(name=py_config["model_registry_namespace"]).delete(wait=True)
+            # create the original namespace object again, so that we can wait for it to be created first
+            original_namespace = Namespace(name=original_namespace_name, wait_for_resource=True)
+            original_namespace.wait_for_status(status=Namespace.Status.ACTIVE)
             wait_for_pods_running(
                 admin_client=admin_client,
                 namespace_name=py_config["applications_namespace"],
                 number_of_consecutive_checks=6,
             )
-            wait_for_pods_running(
-                admin_client=admin_client,
-                namespace_name=py_config["model_registry_namespace"],
-                number_of_consecutive_checks=6,
-            )
-            yield dsc_resource
-
-        for component_name, value in component_patch.items():
-            LOGGER.info(f"Waiting for component {component_name} to be updated.")
-            if original_components[component_name]["managementState"] == DscComponents.ManagementState.MANAGED:
-                dsc_resource.wait_for_condition(
-                    condition=DscComponents.COMPONENT_MAPPING[component_name], status="True"
-                )
-            if (
-                component_name == DscComponents.MODELREGISTRY
-                and value.get("managementState") == DscComponents.ManagementState.MANAGED
-            ):
-                # Since namespace specified in registriesNamespace is automatically created after setting
-                # managementStateto Managed. We need to explicitly delete it on clean up.
-                namespace = Namespace(name=py_config["model_registry_namespace"], ensure_exists=True)
-                if namespace:
-                    namespace.delete(wait=True)
+    else:
+        LOGGER.info("Model Registry is enabled by default and does not require any setup.")
+        yield dsc_resource
 
 
 @pytest.fixture(scope="class")
@@ -293,11 +322,7 @@ def model_registry_rest_url(model_registry_instance_rest_endpoint: list[str]) ->
 
 @pytest.fixture(scope="class")
 def model_registry_rest_headers(current_client_token: str) -> dict[str, str]:
-    return {
-        "Authorization": f"Bearer {current_client_token}",
-        "accept": "application/json",
-        "Content-Type": "application/json",
-    }
+    return get_rest_headers(token=current_client_token)
 
 
 @pytest.fixture(scope="class")
@@ -309,15 +334,12 @@ def model_registry_deployment_containers(model_registry_namespace: str) -> list[
 
 @pytest.fixture(scope="class")
 def model_registry_pod(admin_client: DynamicClient, model_registry_namespace: str) -> Pod:
-    mr_pod = list(
-        Pod.get(
-            dyn_client=admin_client,
-            namespace=model_registry_namespace,
-            label_selector=MODEL_REGISTRY_POD_FILTER,
-        )
-    )
-    assert len(mr_pod) == 1
-    return mr_pod[0]
+    return wait_for_pods_by_labels(
+        admin_client=admin_client,
+        namespace=model_registry_namespace,
+        label_selector=MODEL_REGISTRY_POD_FILTER,
+        expected_num_pods=1,
+    )[0]
 
 
 @pytest.fixture(scope="class")
@@ -462,3 +484,166 @@ def mr_access_role_binding(
         LOGGER.info(f"RoleBinding {binding.name} created successfully.")
         yield binding
         LOGGER.info(f"RoleBinding {binding.name} deletion initiated by context manager.")
+
+
+@pytest.fixture(scope="module")
+def test_idp_user(
+    request: pytest.FixtureRequest,
+    original_user: str,
+    api_server_url: str,
+    is_byoidc: bool,
+) -> Generator[UserTestSession | None, None, None]:
+    """
+    Session-scoped fixture that creates a test IDP user and cleans it up after all tests.
+    Returns a UserTestSession object that contains all necessary credentials and contexts.
+    """
+    if is_byoidc:
+        # For BYOIDC, we would be using a preconfigured group and username for actual api calls.
+        yield
+    else:
+        user_credentials_rbac = request.getfixturevalue(argname="user_credentials_rbac")
+        _ = request.getfixturevalue(argname="created_htpasswd_secret")
+        _ = request.getfixturevalue(argname="updated_oauth_config")
+        idp_session = None
+        try:
+            if wait_for_user_creation(
+                username=user_credentials_rbac["username"],
+                password=user_credentials_rbac["password"],
+                cluster_url=api_server_url,
+            ):
+                # undo the login as test user if we were successful in logging in as test user
+                LOGGER.info(f"Undoing login as test user and logging in as {original_user}")
+                login_with_user_password(api_address=api_server_url, user=original_user)
+
+            idp_session = UserTestSession(
+                idp_name=user_credentials_rbac["idp_name"],
+                secret_name=user_credentials_rbac["secret_name"],
+                username=user_credentials_rbac["username"],
+                password=user_credentials_rbac["password"],
+                original_user=original_user,
+                api_server_url=api_server_url,
+            )
+            LOGGER.info(f"Created session test IDP user: {idp_session.username}")
+
+            yield idp_session
+
+        finally:
+            if idp_session:
+                LOGGER.info(f"Cleaning up test IDP user: {idp_session.username}")
+                idp_session.cleanup()
+
+
+@pytest.fixture(scope="session")
+def api_server_url(admin_client: DynamicClient) -> str:
+    """
+    Get api server url from the cluster.
+    """
+    infrastructure = Infrastructure(client=admin_client, name="cluster", ensure_exists=True)
+    return infrastructure.instance.status.apiServerURL
+
+
+@pytest.fixture(scope="module")
+def created_htpasswd_secret(
+    is_byoidc: bool, original_user: str, user_credentials_rbac: dict[str, str]
+) -> Generator[UserTestSession | None, None, None]:
+    """
+    Session-scoped fixture that creates a test IDP user and cleans it up after all tests.
+    Returns a UserTestSession object that contains all necessary credentials and contexts.
+    """
+    if is_byoidc:
+        yield
+
+    else:
+        temp_path, htpasswd_b64 = create_htpasswd_file(
+            username=user_credentials_rbac["username"], password=user_credentials_rbac["password"]
+        )
+        try:
+            LOGGER.info(f"Creating secret {user_credentials_rbac['secret_name']} in openshift-config namespace")
+            with Secret(
+                name=user_credentials_rbac["secret_name"],
+                namespace="openshift-config",
+                htpasswd=htpasswd_b64,
+                type="Opaque",
+                wait_for_resource=True,
+            ) as secret:
+                yield secret
+        finally:
+            # Clean up the temporary file
+            temp_path.unlink(missing_ok=True)
+
+
+@pytest.fixture(scope="module")
+def updated_oauth_config(
+    is_byoidc: bool, admin_client: DynamicClient, original_user: str, user_credentials_rbac: dict[str, str]
+) -> Generator[Any, None, None]:
+    if is_byoidc:
+        yield
+    else:
+        # Get current providers and add the new one
+        oauth = OAuth(name="cluster")
+        identity_providers = oauth.instance.spec.identityProviders
+
+        new_idp = {
+            "name": user_credentials_rbac["idp_name"],
+            "mappingMethod": "claim",
+            "type": "HTPasswd",
+            "htpasswd": {"fileData": {"name": user_credentials_rbac["secret_name"]}},
+        }
+        updated_providers = identity_providers + [new_idp]
+
+        LOGGER.info("Updating OAuth")
+        identity_providers_patch = ResourceEditor(patches={oauth: {"spec": {"identityProviders": updated_providers}}})
+        identity_providers_patch.update(backup_resources=True)
+        # Wait for OAuth server to be ready
+        wait_for_oauth_openshift_deployment()
+        LOGGER.info(f"Added IDP {user_credentials_rbac['idp_name']} to OAuth configuration")
+        yield
+        identity_providers_patch.restore()
+        wait_for_oauth_openshift_deployment()
+
+
+@pytest.fixture(scope="module")
+def user_credentials_rbac(
+    is_byoidc: bool,
+) -> dict[str, str]:
+    if is_byoidc:
+        byoidc_creds = get_byoidc_user_credentials(username="mr-non-admin")
+        return {
+            "username": byoidc_creds["username"],
+            "password": byoidc_creds["password"],
+            "idp_name": "byoidc",
+            "secret_name": None,
+        }
+    else:
+        random_str = generate_random_name()
+        return {
+            "username": f"test-user-{random_str}",
+            "password": f"test-password-{random_str}",
+            "idp_name": f"test-htpasswd-idp-{random_str}",
+            "secret_name": f"test-htpasswd-secret-{random_str}",
+        }
+
+
+@pytest.fixture(scope="class")
+def catalog_config_map(admin_client: DynamicClient, model_registry_namespace: str) -> ConfigMap:
+    return ConfigMap(name=DEFAULT_CUSTOM_MODEL_CATALOG, client=admin_client, namespace=model_registry_namespace)
+
+
+@pytest.fixture(scope="class")
+def model_catalog_routes(admin_client: DynamicClient, model_registry_namespace: str) -> list[Route]:
+    return list(
+        Route.get(namespace=model_registry_namespace, label_selector="component=model-catalog", dyn_client=admin_client)
+    )
+
+
+@pytest.fixture(scope="class")
+def model_catalog_rest_url(model_registry_namespace: str, model_catalog_routes: list[Route]) -> list[str]:
+    assert model_catalog_routes, f"Model catalog routes does not exist in {model_registry_namespace}"
+    route_urls = [
+        f"https://{route.instance.spec.host}:443/api/model_catalog/v1alpha1/" for route in model_catalog_routes
+    ]
+    assert route_urls, (
+        "Model catalog routes information could not be found from "
+        f"routes:{[route.name for route in model_catalog_routes]}"
+    )
+    return route_urls

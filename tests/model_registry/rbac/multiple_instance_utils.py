@@ -3,11 +3,11 @@ from pytest_testconfig import config as py_config
 
 from tests.model_registry.constants import (
     MODEL_REGISTRY_DB_SECRET_STR_DATA,
-    MR_INSTANCE_NAME,
     DB_BASE_RESOURCES_NAME,
     NUM_MR_INSTANCES,
     MODEL_REGISTRY_DB_SECRET_ANNOTATIONS,
     OAUTH_PROXY_CONFIG_DICT,
+    MR_INSTANCE_BASE_NAME,
 )
 from tests.model_registry.utils import (
     get_model_registry_db_label_dict,
@@ -17,7 +17,6 @@ from tests.model_registry.utils import (
 )
 
 ns_name = py_config["model_registry_namespace"]
-ns_params = {"ns_name": ns_name}
 
 resource_names = [f"{DB_BASE_RESOURCES_NAME}{index}" for index in range(0, NUM_MR_INSTANCES)]
 
@@ -77,9 +76,9 @@ db_deployment_params = [
 
 model_registry_instance_params = [
     {
-        "name": f"{MR_INSTANCE_NAME}{index}",
+        "name": f"{MR_INSTANCE_BASE_NAME}{index}",
         "namespace": ns_name,
-        "label": get_mr_standard_labels(resource_name=f"{MR_INSTANCE_NAME}{index}"),
+        "label": get_mr_standard_labels(resource_name=f"{MR_INSTANCE_BASE_NAME}{index}"),
         "grpc": {},
         "rest": {},
         "mysql": get_mysql_config(base_name=f"{DB_BASE_RESOURCES_NAME}{index}", namespace=ns_name, db_backend="mysql"),
@@ -92,7 +91,6 @@ model_registry_instance_params = [
 # Add this complete set of parameters as a pytest.param tuple to the list.
 MR_MULTIPROJECT_TEST_SCENARIO_PARAMS = [
     pytest.param(
-        ns_params,  # updated_dsc_component_state_parametrized (expects dict)
         db_secret_params,
         db_pvc_params,
         db_service_params,

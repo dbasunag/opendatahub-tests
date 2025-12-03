@@ -1,3 +1,4 @@
+import json
 from typing import Generator, Any
 
 import pytest
@@ -19,6 +20,7 @@ from ocp_resources.service import Service
 from ocp_resources.service_account import ServiceAccount
 from ocp_resources.serving_runtime import ServingRuntime
 from ocp_resources.trustyai_service import TrustyAIService
+from pytest_testconfig import py_config
 
 from tests.model_explainability.trustyai_service.constants import (
     TAI_DATA_CONFIG,
@@ -29,11 +31,11 @@ from tests.model_explainability.trustyai_service.constants import (
     KSERVE_MLSERVER_SUPPORTED_MODEL_FORMATS,
     KSERVE_MLSERVER_ANNOTATIONS,
     GAUSSIAN_CREDIT_MODEL_RESOURCES,
-    GAUSSIAN_CREDIT_MODEL_STORAGE_PATH,
     XGBOOST,
-    GAUSSIAN_CREDIT_MODEL,
     TAI_DB_STORAGE_CONFIG,
     ISVC_GETTER,
+    GAUSSIAN_CREDIT_MODEL_STORAGE_PATH,
+    GAUSSIAN_CREDIT_MODEL,
 )
 from tests.model_explainability.trustyai_service.trustyai_service_utils import (
     wait_for_isvc_deployment_registered_by_trustyai_service,
@@ -48,9 +50,17 @@ from tests.model_explainability.trustyai_service.utils import (
 )
 from utilities.logger import RedactedString
 from utilities.operator_utils import get_cluster_service_version
-from utilities.constants import KServeDeploymentType, Labels, OPENSHIFT_OPERATORS, MARIADB, TRUSTYAI_SERVICE_NAME
+from utilities.constants import (
+    KServeDeploymentType,
+    Labels,
+    OPENSHIFT_OPERATORS,
+    MARIADB,
+    TRUSTYAI_SERVICE_NAME,
+    Annotations,
+)
 from utilities.inference_utils import create_isvc
-from utilities.infra import update_configmap_data, create_inference_token
+from ocp_resources.resource import ResourceEditor
+from utilities.infra import create_inference_token, get_kserve_storage_initialize_image, update_configmap_data
 
 DB_CREDENTIALS_SECRET_NAME: str = "db-credentials"
 DB_NAME: str = "trustyai_db"
@@ -94,6 +104,56 @@ def trustyai_service(
             teardown=teardown_resources,
         ) as trustyai_service:
             yield trustyai_service
+
+
+@pytest.fixture(scope="session")
+def kserve_raw_config(admin_client: DynamicClient) -> Generator[ConfigMap, Any, Any]:
+    """Configure KServe for KServeRaw support by adding logger configuration."""
+
+    storage_initializer_image = get_kserve_storage_initialize_image(client=admin_client)
+    logger_config = {
+        "image": storage_initializer_image,
+        "memoryRequest": "100Mi",
+        "memoryLimit": "1Gi",
+        "cpuRequest": "100m",
+        "cpuLimit": "1",
+        "defaultUrl": "http://default-broker",
+        "caBundle": "kserve-logger-ca-bundle",
+        "caCertFile": "service-ca.crt",
+        "tlsSkipVerify": False,
+    }
+
+    data = {"logger": json.dumps(obj=logger_config)}
+
+    cm = ConfigMap(
+        client=admin_client,
+        name="inferenceservice-config",
+        namespace=py_config["applications_namespace"],
+        ensure_exists=True,
+    )
+
+    with ResourceEditor(
+        patches={
+            cm: {
+                "metadata": {"annotations": {Annotations.OpenDataHubIo.MANAGED: "false"}},
+                "data": data,
+            }
+        }
+    ):
+        yield cm
+
+
+@pytest.fixture(scope="class")
+def kserve_logger_ca_bundle(admin_client: DynamicClient, model_namespace: Namespace) -> Generator[ConfigMap, Any, Any]:
+    """Create CA certificate ConfigMap required for KServeRaw logger."""
+    with ConfigMap(
+        client=admin_client,
+        name="kserve-logger-ca-bundle",
+        namespace=model_namespace.name,
+        annotations={"service.beta.openshift.io/inject-cabundle": "true"},
+        data={},
+    ) as ca_bundle:
+        yield ca_bundle
 
 
 @pytest.fixture(scope="session")
@@ -148,6 +208,11 @@ def mariadb(
     mariadb_dict["spec"]["username"] = DB_USERNAME
 
     mariadb_dict["spec"]["replicas"] = 1
+
+    # Need to fix MariaDB version due to an issue with the default version in certain environments
+    # Using the same registry and image used by the MariaDB operator
+    # --just changing the tag to point to a stable version
+    mariadb_dict["spec"]["image"] = "docker-registry1.mariadb.com/library/mariadb:10.11.8"
     mariadb_dict["spec"]["galera"]["enabled"] = False
     mariadb_dict["spec"]["metrics"]["enabled"] = False
     mariadb_dict["spec"]["tls"] = {"enabled": True, "required": True}
@@ -218,6 +283,8 @@ def gaussian_credit_model(
     minio_service: Service,
     minio_data_connection: Secret,
     mlserver_runtime: ServingRuntime,
+    kserve_raw_config: ConfigMap,
+    kserve_logger_ca_bundle: ConfigMap,
     teardown_resources: bool,
 ) -> Generator[InferenceService, Any, Any]:
     gaussian_credit_model_kwargs = {
@@ -232,12 +299,13 @@ def gaussian_credit_model(
         isvc.clean_up()
     else:
         with create_isvc(
-            deployment_mode=KServeDeploymentType.SERVERLESS,
+            deployment_mode=KServeDeploymentType.RAW_DEPLOYMENT,
             model_format=XGBOOST,
             runtime=mlserver_runtime.name,
             storage_key=minio_data_connection.name,
             storage_path=GAUSSIAN_CREDIT_MODEL_STORAGE_PATH,
             enable_auth=True,
+            external_route=True,
             wait_for_predictor_pods=False,
             resources=GAUSSIAN_CREDIT_MODEL_RESOURCES,
             teardown=teardown_resources,

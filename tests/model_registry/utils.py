@@ -1,5 +1,7 @@
+import base64
 import json
-from typing import Any, List
+import time
+from typing import Any, List, Dict
 
 import requests
 from kubernetes.dynamic import DynamicClient
@@ -13,8 +15,7 @@ from ocp_resources.service import Service
 from ocp_resources.model_registry_modelregistry_opendatahub_io import ModelRegistry
 from kubernetes.dynamic.exceptions import ResourceNotFoundError
 from simple_logger.logger import get_logger
-from timeout_sampler import TimeoutExpiredError, TimeoutSampler, retry
-from kubernetes.dynamic.exceptions import NotFoundError
+from timeout_sampler import retry
 from tests.model_registry.constants import (
     MR_DB_IMAGE_DIGEST,
     MODEL_REGISTRY_DB_SECRET_STR_DATA,
@@ -24,18 +25,20 @@ from tests.model_registry.constants import (
     MARIADB_MY_CNF,
     PORT_MAP,
     MODEL_REGISTRY_POD_FILTER,
-    DEFAULT_MODEL_CATALOG,
+    MR_POSTGRES_DB_OBJECT,
 )
 from tests.model_registry.exceptions import ModelRegistryResourceNotFoundError
 from utilities.exceptions import ProtocolNotSupportedError, TooManyServicesError
-from utilities.constants import Protocols, Annotations, Timeout
+from utilities.constants import Protocols, Annotations, Timeout, PodNotFound
 from model_registry import ModelRegistry as ModelRegistryClient
 from model_registry.types import RegisteredModel
 
+from utilities.general import wait_for_pods_running
+from utilities.user_utils import get_byoidc_issuer_url
 
 ADDRESS_ANNOTATION_PREFIX: str = "routing.opendatahub.io/external-address-"
 MARIA_DB_IMAGE = (
-    "registry.redhat.io/rhel9/mariadb-1011@sha256:e89fe8e65e3ad6d3cf5a90f53032ef73eb63e68bf76ecf06464e30c08c700338"
+    "registry.redhat.io/rhel9/mariadb-1011@sha256:092407d87f8017bb444a462fb3d38ad5070429e94df7cf6b91d82697f36d0fa9"
 )
 LOGGER = get_logger(name=__name__)
 
@@ -128,7 +131,6 @@ def get_model_registry_deployment_template_dict(
                     "args": [
                         "--datadir",
                         "/var/lib/mysql/datadir",
-                        "--default-authentication-plugin=mysql_native_password",
                     ],
                     "image": MR_DB_IMAGE_DIGEST,
                     "imagePullPolicy": "IfNotPresent",
@@ -212,74 +214,6 @@ def get_model_registry_db_label_dict(db_resource_name: str) -> dict[str, str]:
         Annotations.KubernetesIo.INSTANCE: db_resource_name,
         Annotations.KubernetesIo.PART_OF: db_resource_name,
     }
-
-
-def get_pod_container_error_status(pod: Pod) -> str | None:
-    """
-    Check container error status for a given pod and if any containers is in waiting state, return that information
-    """
-    pod_instance_status = pod.instance.status
-    for container_status in pod_instance_status.get("containerStatuses", []):
-        if waiting_container := container_status.get("state", {}).get("waiting"):
-            return waiting_container["reason"] if waiting_container.get("reason") else waiting_container
-    return ""
-
-
-def get_not_running_pods(pods: list[Pod]) -> list[dict[str, Any]]:
-    # Gets all the non-running pods from a given namespace.
-    # Note: We need to keep track of pods marked for deletion as not running. This would ensure any
-    # pod that was spun up in place of pod marked for deletion, are not ignored
-    pods_not_running = []
-    try:
-        for pod in pods:
-            pod_instance = pod.instance
-            if container_status_error := get_pod_container_error_status(pod=pod):
-                pods_not_running.append({pod.name: container_status_error})
-
-            if pod_instance.metadata.get("deletionTimestamp") or pod_instance.status.phase not in (
-                pod.Status.RUNNING,
-                pod.Status.SUCCEEDED,
-            ):
-                pods_not_running.append({pod.name: pod.status})
-    except (ResourceNotFoundError, NotFoundError) as exc:
-        LOGGER.warning("Ignoring pod that disappeared during cluster sanity check: %s", exc)
-    return pods_not_running
-
-
-def wait_for_pods_running(
-    admin_client: DynamicClient,
-    namespace_name: str,
-    number_of_consecutive_checks: int = 1,
-) -> bool | None:
-    """
-    Waits for all pods in a given namespace to reach Running/Completed state. To avoid catching all pods in running
-    state too soon, use number_of_consecutive_checks with appropriate values.
-    """
-    samples = TimeoutSampler(
-        wait_timeout=180,
-        sleep=5,
-        func=get_not_running_pods,
-        pods=list(Pod.get(dyn_client=admin_client, namespace=namespace_name)),
-        exceptions_dict={NotFoundError: [], ResourceNotFoundError: []},
-    )
-    sample = None
-    try:
-        current_check = 0
-        for sample in samples:
-            if not sample:
-                current_check += 1
-                if current_check >= number_of_consecutive_checks:
-                    return True
-            else:
-                current_check = 0
-    except TimeoutExpiredError:
-        if sample:
-            LOGGER.error(
-                f"timeout waiting for all pods in namespace {namespace_name} to reach "
-                f"running state, following pods are in not running state: {sample}"
-            )
-            raise
-    return None
 
 
 @retry(exceptions_dict={TimeoutError: []}, wait_timeout=Timeout.TIMEOUT_2MIN, sleep=5)
@@ -523,7 +457,7 @@ def get_mr_pvc_objects(
                 name=name,
                 namespace=namespace,
                 client=client,
-                size="5Gi",
+                size="3Gi",
                 label=get_model_registry_db_label_dict(db_resource_name=name),
                 teardown=teardown_resources,
             )
@@ -612,11 +546,13 @@ def get_model_registry_objects(
     model_registry_objects = []
     for num_mr in range(0, num):
         name = f"{base_name}{num_mr}"
-        mysql = get_mysql_config(
-            base_name=f"{DB_BASE_RESOURCES_NAME}{num_mr}", namespace=namespace, db_backend=db_backend
-        )
-        if "sslRootCertificateConfigMap" in params:
-            mysql["sslRootCertificateConfigMap"] = params["sslRootCertificateConfigMap"]
+        mysql = None
+        if db_backend != "default":
+            mysql = get_mysql_config(
+                base_name=f"{DB_BASE_RESOURCES_NAME}{num_mr}", namespace=namespace, db_backend=db_backend
+            )
+            if "sslRootCertificateConfigMap" in params:
+                mysql["sslRootCertificateConfigMap"] = params["sslRootCertificateConfigMap"]
         model_registry_objects.append(
             ModelRegistry(
                 client=client,
@@ -626,7 +562,8 @@ def get_model_registry_objects(
                 grpc={},
                 rest={},
                 oauth_proxy=OAUTH_PROXY_CONFIG_DICT,
-                mysql=mysql,
+                mysql=mysql if mysql else None,
+                postgres={"generateDeployment": True} if db_backend == "default" else None,
                 wait_for_resource=True,
                 teardown=teardown_resources,
             )
@@ -719,13 +656,226 @@ def validate_mlmd_removal_in_model_registry_pod_log(
     assert not errors, f"Log validation failed with error(s): {errors}"
 
 
-def delete_model_catalog_configmap(admin_client: DynamicClient, namespace: str) -> None:
-    cfg = ConfigMap(name=DEFAULT_MODEL_CATALOG, client=admin_client, namespace=namespace)
-    if cfg.exists:
-        cfg.delete(wait=True)
+def get_model_catalog_pod(
+    client: DynamicClient, model_registry_namespace: str, label_selector: str = "app.kubernetes.io/name=model-catalog"
+) -> list[Pod]:
+    return list(Pod.get(namespace=model_registry_namespace, label_selector=label_selector, dyn_client=client))
 
 
-def get_model_catalog_pod(client: DynamicClient, model_registry_namespace: str) -> list[Pod]:
-    return list(
-        Pod.get(namespace=model_registry_namespace, label_selector="component=model-catalog", dyn_client=client)
+def get_rest_headers(token: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {token}",
+        "accept": "application/json",
+        "Content-Type": "application/json",
+    }
+
+
+def is_model_catalog_ready(client: DynamicClient, model_registry_namespace: str, consecutive_try: int = 6):
+    model_catalog_pods = get_model_catalog_pod(
+        client=client, model_registry_namespace=model_registry_namespace, label_selector="app=model-catalog"
     )
+    # We can wait for the pods to reflect updated catalog, however, deleting them ensures the updated config is
+    # applied immediately.
+    for pod in model_catalog_pods:
+        pod.delete()
+    # After the deletion, we need to wait for the pod to be spinned up and get to ready state.
+    assert wait_for_model_catalog_pod_created(client=client, model_registry_namespace=model_registry_namespace)
+    wait_for_pods_running(
+        admin_client=client, namespace_name=model_registry_namespace, number_of_consecutive_checks=consecutive_try
+    )
+
+
+@retry(wait_timeout=30, sleep=5, exceptions_dict={PodNotFound: []})
+def wait_for_model_catalog_pod_created(client: DynamicClient, model_registry_namespace: str) -> bool:
+    pods = get_model_catalog_pod(client=client, model_registry_namespace=model_registry_namespace)
+    if pods:
+        return True
+    raise PodNotFound("Model catalog pod not found")
+
+
+def execute_get_call(
+    url: str, headers: dict[str, str], verify: bool | str = False, params: dict[str, Any] | None = None
+) -> requests.Response:
+    LOGGER.info(f"Executing get call: {url}")
+    if params:
+        LOGGER.info(f"params: {params}")
+    resp = requests.get(url=url, headers=headers, verify=verify, timeout=60, params=params)
+    LOGGER.info(f"Encoded url from requests library: {resp.url}")
+    if resp.status_code not in [200, 201]:
+        raise ResourceNotFoundError(f"Get call failed for resource: {url}, {resp.status_code}: {resp.text}")
+    return resp
+
+
+@retry(wait_timeout=60, sleep=5, exceptions_dict={ResourceNotFoundError: []})
+def wait_for_model_catalog_api(url: str, headers: dict[str, str], verify: bool | str = False) -> requests.Response:
+    return execute_get_call(url=f"{url}sources", headers=headers, verify=verify)
+
+
+def execute_get_command(
+    url: str, headers: dict[str, str], verify: bool | str = False, params: dict[str, Any] | None = None
+) -> dict[Any, Any]:
+    resp = execute_get_call(url=url, headers=headers, verify=verify, params=params)
+    try:
+        return json.loads(resp.text)
+    except json.JSONDecodeError:
+        LOGGER.error(f"Unable to parse {resp.text}")
+        raise
+
+
+def get_sample_yaml_str(models: list[str]) -> str:
+    model_str: str = ""
+    for model in models:
+        model_str += f"""
+{get_model_str(model=model)}
+"""
+    return f"""source: Hugging Face
+models:
+{model_str}
+"""
+
+
+def validate_model_catalog_sources(
+    model_catalog_sources_url: str, rest_headers: dict[str, str], expected_catalog_values: dict[str, str]
+) -> None:
+    results = execute_get_command(
+        url=model_catalog_sources_url,
+        headers=rest_headers,
+    )["items"]
+    LOGGER.info(results)
+    # this is for the default catalog:
+    assert len(results) == len(expected_catalog_values) + 2
+    ids_from_query = [result_entry["id"] for result_entry in results]
+    ids_expected = [expected_entry["id"] for expected_entry in expected_catalog_values]
+    assert set(ids_expected).issubset(set(ids_from_query)), f"Expected: {expected_catalog_values}. Actual: {results}"
+
+
+def get_catalog_str(ids: list[str]) -> str:
+    catalog_str: str = ""
+    for index, id in enumerate(ids):
+        catalog_str += f"""
+- name: Sample Catalog {index}
+  id: {id}
+  type: yaml
+  enabled: true
+  properties:
+    yamlCatalogPath: {id.replace("_", "-")}.yaml
+"""
+    return f"""catalogs:
+{catalog_str}
+"""
+
+
+def get_model_str(model: str) -> str:
+    current_time = int(time.time() * 1000)
+    return f"""
+- name: {model}
+  description: test description.
+  readme: |-
+    # test read me information {model}
+  provider: Mistral AI
+  logo: temp placeholder logo
+  license: apache-2.0
+  licenseLink: https://www.apache.org/licenses/LICENSE-2.0.txt
+  libraryName: transformers
+  artifacts:
+    - uri: https://huggingface.co/{model}/resolve/main/consolidated.safetensors
+  createTimeSinceEpoch: \"{str(current_time - 10000)}\"
+  lastUpdateTimeSinceEpoch: \"{str(current_time)}\"
+"""
+
+
+class ResourceNotDeleted(Exception):
+    pass
+
+
+@retry(wait_timeout=360, sleep=5, exceptions_dict={ResourceNotDeleted: []})
+def wait_for_default_resource_cleanedup(admin_client: DynamicClient, namespace_name: str) -> bool:
+    objects_not_deleted = []
+    for kind in [Service, PersistentVolumeClaim, Deployment, Secret]:
+        LOGGER.info(f"Checking if {kind} {MR_POSTGRES_DB_OBJECT[kind]} is deleted")
+        kind_obj = kind(client=admin_client, namespace=namespace_name, name=MR_POSTGRES_DB_OBJECT[kind])
+        if kind_obj.exists:
+            objects_not_deleted.append(f"{kind_obj.kind} - {kind_obj.name}")
+    if not objects_not_deleted:
+        return True
+    raise ResourceNotDeleted(f"Following objects are not deleted: {objects_not_deleted}")
+
+
+def get_mr_user_token(admin_client: DynamicClient, user_credentials_rbac: dict[str, str]) -> str:
+    url = f"{get_byoidc_issuer_url(admin_client=admin_client)}/protocol/openid-connect/token"
+    headers = {"Content-Type": "application/x-www-form-urlencoded", "User-Agent": "python-requests"}
+
+    data = {
+        "username": user_credentials_rbac["username"],
+        "password": user_credentials_rbac["password"],
+        "grant_type": "password",
+        "client_id": "oc-cli",
+        "scope": "openid",
+    }
+
+    try:
+        LOGGER.info(f"Requesting token for user {user_credentials_rbac['username']} in byoidc environment")
+        response = requests.post(
+            url=url,
+            headers=headers,
+            data=data,
+            allow_redirects=True,
+            timeout=30,
+            verify=True,  # Set to False if you need to skip SSL verification
+        )
+        response.raise_for_status()
+        json_response = response.json()
+
+        # Validate that we got an access token
+        if "id_token" not in json_response:
+            LOGGER.error("Warning: No id_token in response")
+            raise AssertionError(f"No id_token in response: {json_response}")
+        return json_response["id_token"]
+    except Exception as e:
+        raise e
+
+
+def get_byoidc_user_credentials(username: str = None) -> Dict[str, str]:
+    """
+    Get user credentials from byoidc-credentials secret.
+
+    Args:
+        username: Specific username to look up. If None, returns first user.
+
+    Returns:
+        Dictionary with username and password for the specified user.
+
+    Raises:
+        ValueError: If username not found or no users/passwords in secret.
+        AssertionError: If users or passwords lists are empty.
+    """
+    credentials_secret = Secret(name="byoidc-credentials", namespace="oidc", ensure_exists=True)
+    credential_data = credentials_secret.instance.data
+    user_names = base64.b64decode(credential_data.users).decode().split(",")
+    passwords = base64.b64decode(credential_data.passwords).decode().split(",")
+
+    # Assert that both lists are not empty
+    assert user_names and user_names != [""], "No usernames found in byoidc-credentials secret"
+    assert passwords and passwords != [""], "No passwords found in byoidc-credentials secret"
+
+    # Use specified username or default to first user
+    requested_username = username if username else user_names[0]
+
+    if requested_username and requested_username in user_names:
+        # Find the index of the requested username
+        user_index = user_names.index(requested_username)
+        if user_index < len(passwords):
+            selected_username = user_names[user_index]
+            selected_password = passwords[user_index]
+        else:
+            raise ValueError(f"Password not found for user '{requested_username}' at index {user_index}")
+    elif requested_username:
+        raise ValueError(f"Username '{requested_username}' not found in byoidc credentials")
+    else:
+        raise ValueError("No users found in byoidc credentials")
+
+    LOGGER.info(f"Using byoidc-credentials username='{selected_username}'")
+    return {
+        "username": selected_username,
+        "password": selected_password,
+    }

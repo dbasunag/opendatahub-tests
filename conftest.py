@@ -19,6 +19,7 @@ from pytest import (
     Config,
     CollectReport,
 )
+from _pytest.nodes import Node
 from _pytest.terminal import TerminalReporter
 from typing import Optional, Any
 from pytest_testconfig import config as py_config
@@ -243,12 +244,20 @@ def pytest_collection_modifyitems(session: Session, config: Config, items: list[
             _item=item, _upgrade_deployment_modes=upgrade_deployment_modes
         ):
             pre_upgrade_tests.append(item)
-
+            # Add support to be able to reuse tests in both upgrade and fresh install scenarios
+            if "install" in item.keywords:
+                non_upgrade_tests.append(item)
+            if "post_upgrade" in item.keywords:
+                post_upgrade_tests.append(item)
         elif "post_upgrade" in item.keywords and _add_upgrade_test(
             _item=item, _upgrade_deployment_modes=upgrade_deployment_modes
         ):
             post_upgrade_tests.append(item)
-
+            # Add support to be able to reuse tests in both upgrade and fresh install scenarios
+            if "install" in item.keywords:
+                non_upgrade_tests.append(item)
+            if "pre_upgrade" in item.keywords:
+                pre_upgrade_tests.append(item)
         else:
             non_upgrade_tests.append(item)
 
@@ -272,17 +281,51 @@ def pytest_collection_modifyitems(session: Session, config: Config, items: list[
 
 
 def pytest_sessionstart(session: Session) -> None:
-    log_file = session.config.getoption("log_file") or "pytest-tests.log"
+    log_file = session.config.getoption(name="log_file") or "pytest-tests.log"
     tests_log_file = os.path.join(get_base_dir(), log_file)
-    LOGGER.info(f"Writing tests log to {tests_log_file}")
+    thread_name = os.environ.get("PYTEST_XDIST_WORKER", "")
+
+    # Get log level and convert to integer if it's a string
+    log_cli_level = session.config.getoption(name="log_cli_level")
+    if log_cli_level and isinstance(log_cli_level, str):
+        log_level = getattr(logging, log_cli_level.upper(), logging.INFO)
+    else:
+        log_level = log_cli_level or logging.INFO
+
+    # Clean up old log file BEFORE setting up logging
     if os.path.exists(tests_log_file):
         pathlib.Path(tests_log_file).unlink()
-    if session.config.getoption("--collect-must-gather"):
-        session.config.option.must_gather_db = Database()
+
+    # Default behavior: enable console unless explicitly disabled
+    enable_console_value = True  # Default to console enabled
+
+    # Check for explicit -o log_cli option in command line overrides
+    try:
+        overrides = getattr(session.config.option, "override_ini", []) or []
+        log_cli_override = next((override for override in overrides if override.startswith("log_cli=")), None)
+
+        if log_cli_override:
+            value = log_cli_override.split("=", 1)[1].lower()
+            enable_console_value = value not in ("false", "0", "no", "off")
+
+    except Exception as e:
+        # If there's any issue with option detection, fall back to default behavior
+        LOGGER.error(f"Error detecting log_cli option: {e}")
+        enable_console_value = True
+
+    # Setup logging before any other operations
     session.config.option.log_listener = setup_logging(
         log_file=tests_log_file,
-        log_level=session.config.getoption("log_cli_level") or logging.INFO,
+        log_level=log_level,
+        thread_name=thread_name,
+        enable_console=enable_console_value,
     )
+
+    # Now safe to log after configuration is applied (only to file when console disabled)
+    LOGGER.info(f"Writing tests log to {tests_log_file}")
+
+    if session.config.getoption("--collect-must-gather"):
+        session.config.option.must_gather_db = Database()
     must_gather_dict = set_must_gather_collector_values()
     shutil.rmtree(
         path=must_gather_dict["must_gather_base_directory"],
@@ -306,6 +349,8 @@ def updated_global_config(admin_client: DynamicClient, config: Config) -> None:
     distribution = get_operator_distribution(client=admin_client)
     if distribution == "Open Data Hub":
         py_config["distribution"] = "upstream"
+        # override the operator namespace
+        py_config["operator_namespace"] = "opendatahub-operators"
 
     elif distribution.startswith("OpenShift AI"):
         py_config["distribution"] = "downstream"
@@ -355,13 +400,7 @@ def pytest_runtest_setup(item: Item) -> None:
         except Exception as db_exception:
             LOGGER.error(f"Database error: {db_exception}. Must-gather collection may not be accurate")
 
-    if KServeDeploymentType.SERVERLESS.lower() in item.keywords:
-        item.fixturenames.insert(0, "fail_if_missing_dependent_operators")
-
-    if KServeDeploymentType.SERVERLESS.lower() in item.keywords:
-        item.fixturenames.insert(0, "enabled_kserve_in_dsc")
-
-    elif KServeDeploymentType.RAW_DEPLOYMENT.lower() in item.keywords:
+    if KServeDeploymentType.RAW_DEPLOYMENT.lower() in item.keywords:
         item.fixturenames.insert(0, "enabled_kserve_in_dsc")
 
     elif KServeDeploymentType.MODEL_MESH.lower() in item.keywords:
@@ -434,9 +473,17 @@ def calculate_must_gather_timer(test_start_time: int) -> int:
         return default_duration
 
 
+def get_all_node_markers(node: Node) -> list[str]:
+    return [mark.name for mark in list(node.iter_markers())]
+
+
+def is_skip_must_gather(node: Node) -> bool:
+    return "skip_must_gather" in get_all_node_markers(node=node)
+
+
 def pytest_exception_interact(node: Item | Collector, call: CallInfo[Any], report: TestReport | CollectReport) -> None:
     LOGGER.error(report.longreprtext)
-    if node.config.getoption("--collect-must-gather"):
+    if node.config.getoption("--collect-must-gather") and not is_skip_must_gather(node=node):
         test_name = f"{node.fspath}::{node.name}"
         LOGGER.info(f"Must-gather collection is enabled for {test_name}.")
 
@@ -449,6 +496,7 @@ def pytest_exception_interact(node: Item | Collector, call: CallInfo[Any], repor
 
         try:
             collect_rhoai_must_gather(
+                base_file_name=f"mg-{test_start_time}",
                 since=calculate_must_gather_timer(test_start_time=test_start_time),
                 target_dir=os.path.join(get_must_gather_collector_dir(), "pytest_exception_interact"),
             )

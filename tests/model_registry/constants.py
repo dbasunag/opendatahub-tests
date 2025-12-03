@@ -1,5 +1,10 @@
 from typing import Any
+
+from ocp_resources.deployment import Deployment
+from ocp_resources.persistent_volume_claim import PersistentVolumeClaim
 from ocp_resources.resource import Resource
+from ocp_resources.secret import Secret
+from ocp_resources.service import Service
 from utilities.constants import ModelFormat
 
 
@@ -36,7 +41,7 @@ OAUTH_PROXY_CONFIG_DICT: dict[str, Any] = {
 DB_BASE_RESOURCES_NAME: str = "db-model-registry"
 DB_RESOURCE_NAME: str = f"{DB_BASE_RESOURCES_NAME}0"
 MR_DB_IMAGE_DIGEST: str = (
-    "public.ecr.aws/docker/library/mysql@sha256:9de9d54fecee6253130e65154b930978b1fcc336bcc86dfd06e89b72a2588ebe"
+    "public.ecr.aws/docker/library/mysql@sha256:28540698ce89bd72f985044de942d65bd99c6fadb2db105327db57f3f70564f0"
 )
 MODEL_REGISTRY_DB_SECRET_STR_DATA: dict[str, str] = {
     "database-name": "model_registry",
@@ -64,4 +69,15 @@ PORT_MAP = {
     "mysql": 3306,
 }
 MODEL_REGISTRY_POD_FILTER: str = "component=model-registry"
-DEFAULT_MODEL_CATALOG: str = "model-catalog-sources"
+DEFAULT_CUSTOM_MODEL_CATALOG: str = "model-catalog-sources"
+SAMPLE_MODEL_NAME1 = "mistralai/Mistral-7B-Instruct-v0.3"
+CUSTOM_CATALOG_ID1: str = "sample_custom_catalog1"
+DEFAULT_MODEL_CATALOG_CM: str = "model-catalog-default-sources"
+KUBERBACPROXY_STR: str = "KubeRBACProxyAvailable"
+MR_POSTGRES_DB_OBJECT: dict[Any, str] = {
+    Service: f"{MR_INSTANCE_NAME}-postgres",
+    PersistentVolumeClaim: f"{MR_INSTANCE_NAME}-postgres-storage",
+    Deployment: f"{MR_INSTANCE_NAME}-postgres",
+    Secret: f"{MR_INSTANCE_NAME}-postgres-credentials",
+}
+MR_POSTGRES_DEPLOYMENT_NAME_STR = f"{MR_INSTANCE_NAME}-postgres"

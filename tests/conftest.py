@@ -1,10 +1,11 @@
 import base64
+import binascii
 import os
 import shutil
 from ast import literal_eval
 from typing import Any, Callable, Generator
-
 import pytest
+from semver import Version
 import shortuuid
 import yaml
 from _pytest._py.path import LocalPath
@@ -13,6 +14,7 @@ from _pytest.tmpdir import TempPathFactory
 from kubernetes.dynamic.exceptions import ResourceNotFoundError
 
 from ocp_resources.cluster_service_version import ClusterServiceVersion
+from ocp_resources.cluster_version import ClusterVersion
 from ocp_resources.config_map import ConfigMap
 from ocp_resources.deployment import Deployment
 from ocp_resources.dsc_initialization import DSCInitialization
@@ -43,6 +45,7 @@ from utilities.infra import (
     login_with_user_password,
     get_openshift_token,
     download_oc_console_cli,
+    get_cluster_authentication,
 )
 from utilities.constants import (
     AcceleratorType,
@@ -58,10 +61,17 @@ from utilities.logger import RedactedString
 from utilities.mariadb_utils import wait_for_mariadb_operator_deployments
 from utilities.minio import create_minio_data_connection_secret
 from utilities.operator_utils import get_csv_related_images, get_cluster_service_version
+from ocp_resources.authentication_config_openshift_io import Authentication
+from utilities.user_utils import get_oidc_tokens, get_byoidc_issuer_url
 
 LOGGER = get_logger(name=__name__)
 
-pytest_plugins = ["tests.fixtures.inference", "tests.fixtures.guardrails", "tests.fixtures.trustyai"]
+pytest_plugins = [
+    "tests.fixtures.inference",
+    "tests.fixtures.guardrails",
+    "tests.fixtures.trustyai",
+    "tests.fixtures.vector_io",
+]
 
 
 @pytest.fixture(scope="session")
@@ -69,20 +79,18 @@ def admin_client() -> DynamicClient:
     return get_client()
 
 
-@pytest.fixture(scope="session", autouse=True)
+@pytest.fixture(scope="session")
 def tests_tmp_dir(request: FixtureRequest, tmp_path_factory: TempPathFactory) -> Generator[None, None, None]:
     base_path = os.path.join(request.config.option.basetemp, "tests")
     tests_tmp_path = tmp_path_factory.mktemp(basename=base_path)
     py_config["tmp_base_dir"] = str(tests_tmp_path)
-
     yield
-
     shutil.rmtree(path=str(tests_tmp_path), ignore_errors=True)
 
 
 @pytest.fixture(scope="session")
 def current_client_token(admin_client: DynamicClient) -> str:
-    return RedactedString(value=get_openshift_token())
+    return RedactedString(value=get_openshift_token(client=admin_client))
 
 
 @pytest.fixture(scope="session")
@@ -150,7 +158,11 @@ def registry_pull_secret(pytestconfig: Config) -> str:
             "Registry pull secret is not set. "
             "Either pass with `--registry_pull_secret` or set `OCI_REGISTRY_PULL_SECRET` environment variable"
         )
-    return registry_pull_secret
+    try:
+        base64.b64decode(s=registry_pull_secret, validate=True)
+        return registry_pull_secret
+    except binascii.Error:
+        raise ValueError("Registry pull secret is not a valid base64 encoded string")
 
 
 @pytest.fixture(scope="session")
@@ -302,10 +314,12 @@ def mlserver_runtime_image(pytestconfig: pytest.Config) -> str | None:
 
 
 @pytest.fixture(scope="session")
-def triton_runtime_image(pytestconfig: pytest.Config) -> str | None:
+def triton_runtime_image(pytestconfig: pytest.Config) -> str:
+    from tests.model_serving.model_runtime.triton.constant import TRITON_IMAGE
+
     runtime_image = pytestconfig.option.triton_runtime_image
     if not runtime_image:
-        return None
+        return TRITON_IMAGE
     return runtime_image
 
 
@@ -328,28 +342,33 @@ def use_unprivileged_client(pytestconfig: pytest.Config) -> bool:
 
 
 @pytest.fixture(scope="session")
-def non_admin_user_password(admin_client: DynamicClient, use_unprivileged_client: bool) -> tuple[str, str] | None:
+def non_admin_user_password(
+    admin_client: DynamicClient, use_unprivileged_client: bool, is_byoidc: bool
+) -> tuple[str, str] | None:
     def _decode_split_data(_data: str) -> list[str]:
         return base64.b64decode(_data).decode().split(",")
 
     if not use_unprivileged_client:
         return None
 
-    if ldap_Secret := list(
+    secret_name = "byoidc-credentials" if is_byoidc else "openldap"  # pragma: allowlist secret
+    secret_ns = "oidc" if is_byoidc else "openldap"  # pragma: allowlist secret
+
+    if users_Secret := list(
         Secret.get(
             dyn_client=admin_client,
-            name="openldap",
-            namespace="openldap",
+            name=secret_name,
+            namespace=secret_ns,
         )
     ):
-        data = ldap_Secret[0].instance.data
+        data = users_Secret[0].instance.data
         users = _decode_split_data(_data=data.users)
         passwords = _decode_split_data(_data=data.passwords)
         first_user_index = next(index for index, user in enumerate(users) if "user" in user)
 
         return users[first_user_index], passwords[first_user_index]
 
-    LOGGER.error("ldap secret not found")
+    LOGGER.error("user credentials secret not found")
     return None
 
 
@@ -365,11 +384,25 @@ def kubconfig_filepath() -> str:
 
 
 @pytest.fixture(scope="session")
+def cluster_authentication(admin_client: DynamicClient) -> Authentication | None:
+    return get_cluster_authentication(admin_client=admin_client)
+
+
+@pytest.fixture(scope="session")
+def is_byoidc(cluster_authentication: Authentication | None) -> bool:
+    if cluster_authentication:
+        return cluster_authentication.instance.spec.type == "OIDC"
+    else:
+        return False
+
+
+@pytest.fixture(scope="session")
 def unprivileged_client(
     admin_client: DynamicClient,
     use_unprivileged_client: bool,
     kubconfig_filepath: str,
     non_admin_user_password: tuple[str, str],
+    is_byoidc: bool,
 ) -> Generator[DynamicClient, Any, Any]:
     """
     Provides none privileged API client. If non_admin_user_password is None, then it will raise.
@@ -380,6 +413,46 @@ def unprivileged_client(
 
     elif non_admin_user_password is None:
         raise ValueError("Unprivileged user not provisioned")
+
+    elif is_byoidc:
+        tokens = get_oidc_tokens(admin_client, non_admin_user_password[0], non_admin_user_password[1])
+        issuer = get_byoidc_issuer_url(admin_client)
+
+        with open(kubconfig_filepath) as fd:
+            kubeconfig_content = yaml.safe_load(fd)
+
+        # create the oidc user config
+        user = {
+            "name": non_admin_user_password[0],
+            "user": {
+                "auth-provider": {
+                    "name": "oidc",
+                    "config": {
+                        "client-id": "oc-cli",
+                        "client-secret": "",
+                        "idp-issuer-url": issuer,
+                        "id-token": tokens[0],
+                        "refresh-token": tokens[1],
+                    },
+                }
+            },
+        }
+
+        # replace the users - we only need this one user
+        kubeconfig_content["users"] = [user]
+
+        # get the current context and modify the referenced user in place
+        current_context_name = kubeconfig_content["current-context"]
+        current_context = [c for c in kubeconfig_content["contexts"] if c["name"] == current_context_name][0]
+        current_context["context"]["user"] = non_admin_user_password[0]
+
+        unprivileged_client = get_client(
+            config_dict=kubeconfig_content,
+            context=current_context_name,
+            persist_config=False,  # keep the kubeconfig intact
+        )
+
+        yield unprivileged_client
 
     else:
         current_user = run_command(command=["oc", "whoami"])[1].strip()
@@ -517,6 +590,7 @@ def minio_pod(
         label=pod_labels,
         annotations=request.param.get("annotations"),
     ) as minio_pod:
+        minio_pod.wait_for_status(status=Pod.Status.RUNNING)
         yield minio_pod
 
 
@@ -624,6 +698,20 @@ def bin_directory_to_os_path(os_path_environment: str, bin_directory: LocalPath,
 
 
 @pytest.fixture(scope="session")
+def openshift_version(admin_client: DynamicClient) -> Version:
+    """Get the OpenShift cluster version."""
+    cluster_version = ClusterVersion(client=admin_client, name="version", ensure_exists=True)
+
+    if not cluster_version.instance.status.history:
+        raise ValueError("ClusterVersion history is empty")
+
+    try:
+        return Version.parse(version=str(cluster_version.instance.status.history[0].version))
+    except (ValueError, TypeError) as e:
+        raise ValueError(f"Failed to parse OpenShift version: {e}") from e
+
+
+@pytest.fixture(scope="session")
 def oc_binary_path(bin_directory: LocalPath) -> str:
     installed_oc_binary_path = os.getenv("OC_BINARY_PATH")
     if installed_oc_binary_path:
@@ -634,8 +722,10 @@ def oc_binary_path(bin_directory: LocalPath) -> str:
 
 
 @pytest.fixture(scope="session", autouse=True)
-@pytest.mark.early(order=0)
 def autouse_fixtures(
+    admin_client: DynamicClient,
+    dsc_resource: DataScienceCluster,
+    tests_tmp_dir: None,
     bin_directory_to_os_path: None,
     cluster_sanity_scope_session: None,
 ) -> None:
@@ -697,3 +787,35 @@ def mariadb_operator_cr(
         )
         wait_for_mariadb_operator_deployments(mariadb_operator=mariadb_operator_cr)
         yield mariadb_operator_cr
+
+
+@pytest.fixture(scope="session")
+def gpu_count_on_cluster(nodes: list[Any]) -> int:
+    """Return total GPU count across all nodes in the cluster.
+
+    Counts full-GPU extended resources only:
+      - nvidia.com/gpu
+      - amd.com/gpu
+      - gpu.intel.com/*  (e.g., i915, xe)
+    Note: MIG slice resources (nvidia.com/mig-*) are intentionally ignored.
+    """
+    total_gpus = 0
+    allowed_exact = {"nvidia.com/gpu", "amd.com/gpu", "intel.com/gpu"}
+    allowed_prefixes = ("gpu.intel.com/",)
+    for node in nodes:
+        allocatable = getattr(node.instance.status, "allocatable", {}) or {}
+        for key, val in allocatable.items():
+            if key in allowed_exact or any(key.startswith(p) for p in allowed_prefixes):
+                try:
+                    total_gpus += int(val)
+                except (ValueError, TypeError):
+                    LOGGER.debug(f"Skipping non-integer allocatable for {key} on {node.name}: {val!r}")
+                    continue
+    return total_gpus
+
+
+@pytest.fixture(scope="session")
+def original_user() -> str:
+    current_user = run_command(command=["oc", "whoami"])[1].strip()
+    LOGGER.info(f"Original user: {current_user}")
+    return current_user
